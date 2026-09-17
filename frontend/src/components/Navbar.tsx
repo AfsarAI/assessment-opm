@@ -10,16 +10,28 @@ interface NavbarProps {
 }
 
 export const Navbar: React.FC<NavbarProps> = ({ activeTab, onSelectTab }) => {
-  const [healthStatus, setHealthStatus] = useState<"checking" | "online" | "offline">("checking");
+  const [healthStatus, setHealthStatus] = useState<"checking" | "online" | "waking" | "offline">("checking");
+  const [retrySeconds, setRetrySeconds] = useState(0);
 
   useEffect(() => {
+    let timer: NodeJS.Timeout;
     const check = async () => {
       const res = await getHealth();
-      setHealthStatus(res.status === "ok" ? "online" : "offline");
+      if (res.status === "ok") {
+        setHealthStatus("online");
+        setRetrySeconds(0);
+        timer = setTimeout(check, 30000);
+      } else if (res.status === "waking") {
+        setHealthStatus("waking");
+        setRetrySeconds((prev) => prev + 3);
+        timer = setTimeout(check, 3000);
+      } else {
+        setHealthStatus("offline");
+        timer = setTimeout(check, 10000);
+      }
     };
     check();
-    const interval = setInterval(check, 30000);
-    return () => clearInterval(interval);
+    return () => clearTimeout(timer);
   }, []);
 
   const navItems = [
@@ -67,24 +79,41 @@ export const Navbar: React.FC<NavbarProps> = ({ activeTab, onSelectTab }) => {
 
         <div className="flex items-center gap-3">
           <div
-            className={`flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ${
+            className={`flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium transition-colors ${
               healthStatus === "online"
                 ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-400"
+                : healthStatus === "waking"
+                ? "bg-amber-50 text-amber-800 dark:bg-amber-950/50 dark:text-amber-300 border border-amber-300 dark:border-amber-800"
                 : healthStatus === "checking"
-                ? "bg-amber-50 text-amber-700 dark:bg-amber-950/50 dark:text-amber-400"
+                ? "bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300"
                 : "bg-rose-50 text-rose-700 dark:bg-rose-950/50 dark:text-rose-400"
             }`}
+            title={
+              healthStatus === "waking"
+                ? "Render Free instance is spinning up after 15m idle (takes ~50s on wake). Reconnecting..."
+                : undefined
+            }
           >
             <span
               className={`h-2 w-2 rounded-full ${
                 healthStatus === "online"
                   ? "bg-emerald-500 animate-pulse"
+                  : healthStatus === "waking"
+                  ? "bg-amber-500 animate-ping"
                   : healthStatus === "checking"
-                  ? "bg-amber-500"
+                  ? "bg-zinc-400"
                   : "bg-rose-500"
               }`}
             />
-            <span>{healthStatus === "online" ? "API Online" : healthStatus === "checking" ? "Checking..." : "Offline"}</span>
+            <span>
+              {healthStatus === "online"
+                ? "API Online"
+                : healthStatus === "waking"
+                ? `Waking Server (${retrySeconds > 0 ? `${retrySeconds}s` : "..."})`
+                : healthStatus === "checking"
+                ? "Checking..."
+                : "API Offline"}
+            </span>
           </div>
         </div>
       </div>

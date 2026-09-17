@@ -2,21 +2,30 @@
 
 import React, { useState, useEffect, useRef } from "react";
 import { UploadCloud, CheckCircle2, AlertTriangle, Clock, RefreshCw, FileText, XCircle } from "lucide-react";
-import { uploadCsv, getImports, getImportProgressUrl } from "@/lib/api";
+import { uploadCsv, getImports, getImport, getImportProgressUrl } from "@/lib/api";
 import { ImportJob, ImportProgressEvent } from "@/types";
 
 export const ImportManager: React.FC = () => {
   const [file, setFile] = useState<File | null>(null);
   const [isUploading, setIsUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<{ percent: number; loaded: number; total: number } | null>(null);
   const [activeJob, setActiveJob] = useState<ImportJob | null>(null);
   const [recentJobs, setRecentJobs] = useState<ImportJob[]>([]);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
+  const fallbackPollRef = useRef<NodeJS.Timeout | null>(null);
 
   const loadRecentJobs = async () => {
     try {
       const jobs = await getImports(10);
       setRecentJobs(jobs);
+
+      // Auto-reconnect if any background job is actively processing
+      const active = jobs.find((j) => ["QUEUED", "PARSING", "VALIDATING", "IMPORTING"].includes(j.status));
+      if (active) {
+        setActiveJob(active);
+        connectSse(active.id);
+      }
     } catch {
       // Ignored
     }
@@ -28,12 +37,19 @@ export const ImportManager: React.FC = () => {
       if (eventSourceRef.current) {
         eventSourceRef.current.close();
       }
+      if (fallbackPollRef.current) {
+        clearInterval(fallbackPollRef.current);
+      }
     };
   }, []);
 
   const connectSse = (jobId: string) => {
     if (eventSourceRef.current) {
       eventSourceRef.current.close();
+    }
+    if (fallbackPollRef.current) {
+      clearInterval(fallbackPollRef.current);
+      fallbackPollRef.current = null;
     }
 
     const sseUrl = getImportProgressUrl(jobId);
@@ -58,8 +74,30 @@ export const ImportManager: React.FC = () => {
           };
         });
 
-        if (data.status === "COMPLETED" || data.status === "COMPLETED_WITH_ERRORS" || data.status === "FAILED") {
+        // Sync history table in real time
+        setRecentJobs((prev) =>
+          prev.map((j) =>
+            j.id === jobId
+              ? {
+                  ...j,
+                  status: data.status,
+                  progress: data.progress,
+                  processed_rows: data.processed_rows,
+                  total_rows: data.total_rows,
+                  successful_rows: data.successful_rows,
+                  failed_rows: data.failed_rows,
+                  stage_message: data.stage_message,
+                }
+              : j
+          )
+        );
+
+        if (["COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED"].includes(data.status)) {
           es.close();
+          if (fallbackPollRef.current) {
+            clearInterval(fallbackPollRef.current);
+            fallbackPollRef.current = null;
+          }
           loadRecentJobs();
         }
       } catch (err) {
@@ -69,6 +107,23 @@ export const ImportManager: React.FC = () => {
 
     es.onerror = () => {
       es.close();
+      // Start fallback polling if SSE connection drops
+      if (!fallbackPollRef.current) {
+        fallbackPollRef.current = setInterval(async () => {
+          try {
+            const current = await getImport(jobId);
+            setActiveJob(current);
+            setRecentJobs((prev) => prev.map((j) => (j.id === jobId ? current : j)));
+            if (["COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED"].includes(current.status)) {
+              if (fallbackPollRef.current) {
+                clearInterval(fallbackPollRef.current);
+                fallbackPollRef.current = null;
+              }
+              loadRecentJobs();
+            }
+          } catch {}
+        }, 2000);
+      }
     };
   };
 
@@ -83,9 +138,13 @@ export const ImportManager: React.FC = () => {
     if (!file) return;
     setIsUploading(true);
     setUploadError(null);
+    setUploadProgress({ percent: 0, loaded: 0, total: file.size });
 
     try {
-      const res = await uploadCsv(file);
+      const res = await uploadCsv(file, (percent, loaded, total) => {
+        setUploadProgress({ percent, loaded, total });
+      });
+
       const newJob: ImportJob = {
         id: res.import_id,
         filename: file.name,
@@ -99,12 +158,16 @@ export const ImportManager: React.FC = () => {
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       };
+
+      setRecentJobs((prev) => [newJob, ...prev.filter((j) => j.id !== newJob.id)]);
       setActiveJob(newJob);
       setFile(null);
+      setUploadProgress(null);
       // Connect to live SSE progress stream
       connectSse(res.import_id);
     } catch (err: any) {
       setUploadError(err.message || "Failed to initiate upload");
+      setUploadProgress(null);
     } finally {
       setIsUploading(false);
     }
@@ -173,6 +236,27 @@ export const ImportManager: React.FC = () => {
           </div>
         )}
 
+        {uploadProgress && isUploading && (
+          <div className="mt-4 rounded-xl border border-indigo-200 bg-indigo-50/50 p-4 dark:border-indigo-900/50 dark:bg-indigo-950/20">
+            <div className="flex justify-between text-xs font-semibold text-indigo-900 dark:text-indigo-200 mb-1.5">
+              <span className="flex items-center gap-2">
+                <RefreshCw className="h-3.5 w-3.5 animate-spin text-indigo-600" />
+                Uploading to server: {(uploadProgress.loaded / (1024 * 1024)).toFixed(1)} MB / {(uploadProgress.total / (1024 * 1024)).toFixed(1)} MB
+              </span>
+              <span>{uploadProgress.percent}%</span>
+            </div>
+            <div className="h-2 w-full overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-800">
+              <div
+                className="h-full bg-indigo-600 transition-all duration-150 ease-out"
+                style={{ width: `${Math.max(uploadProgress.percent, 2)}%` }}
+              />
+            </div>
+            <p className="mt-1.5 text-xs text-zinc-500 dark:text-zinc-400">
+              Streaming file directly to server disk without memory buffering...
+            </p>
+          </div>
+        )}
+
         <div className="mt-6 flex justify-end">
           <button
             onClick={handleUpload}
@@ -182,7 +266,7 @@ export const ImportManager: React.FC = () => {
             {isUploading ? (
               <>
                 <RefreshCw className="h-4 w-4 animate-spin" />
-                <span>Uploading...</span>
+                <span>Uploading ({uploadProgress ? `${uploadProgress.percent}%` : "..."})</span>
               </>
             ) : (
               <span>Start Ingestion</span>

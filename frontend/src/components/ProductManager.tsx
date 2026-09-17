@@ -33,7 +33,10 @@ export const ProductManager: React.FC = () => {
     has_prev: false,
   });
 
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  // Filter states
   const [skuFilter, setSkuFilter] = useState("");
   const [nameFilter, setNameFilter] = useState("");
   const [descFilter, setDescFilter] = useState("");
@@ -59,6 +62,7 @@ export const ProductManager: React.FC = () => {
   const fetchProducts = useCallback(async () => {
     setLoading(true);
     try {
+      setLoadError(null);
       const res = await getProducts({
         page: currentPage,
         limit: pageSize,
@@ -71,6 +75,7 @@ export const ProductManager: React.FC = () => {
       setPagination(res.pagination);
     } catch (err: any) {
       console.error("Failed to load products:", err);
+      setLoadError(err.message || "Failed to load products");
     } finally {
       setLoading(false);
     }
@@ -79,6 +84,15 @@ export const ProductManager: React.FC = () => {
   useEffect(() => {
     fetchProducts();
   }, [fetchProducts]);
+
+  // Auto-reconnect if server was sleeping
+  useEffect(() => {
+    if (!loadError) return;
+    const timer = setTimeout(() => {
+      fetchProducts();
+    }, 4000);
+    return () => clearTimeout(timer);
+  }, [loadError, fetchProducts]);
 
   const handleToggleStatus = async (product: Product) => {
     try {
@@ -301,6 +315,20 @@ export const ProductManager: React.FC = () => {
                   <td colSpan={5} className="py-12 text-center text-zinc-500">
                     <RefreshCw className="inline h-5 w-5 animate-spin text-indigo-600 mb-2" />
                     <p>Loading products from PostgreSQL...</p>
+                  </td>
+                </tr>
+              ) : loadError ? (
+                <tr>
+                  <td colSpan={5} className="py-12 text-center text-amber-800 dark:text-amber-200">
+                    <AlertTriangle className="inline h-6 w-6 text-amber-500 mb-2" />
+                    <p className="font-semibold">Backend server is spinning up or temporarily unavailable.</p>
+                    <p className="text-xs text-zinc-500 mt-1">Render Free tier instances take ~50s on wake. Reconnecting automatically...</p>
+                    <button
+                      onClick={() => fetchProducts()}
+                      className="mt-3 inline-flex items-center gap-1.5 rounded-md bg-amber-100 px-3 py-1.5 text-xs font-semibold text-amber-900 hover:bg-amber-200 transition-colors dark:bg-amber-950/60 dark:text-amber-300"
+                    >
+                      <RefreshCw className="h-3 w-3" /> Retry Now
+                    </button>
                   </td>
                 </tr>
               ) : products.length === 0 ? (

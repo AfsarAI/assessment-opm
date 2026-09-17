@@ -91,7 +91,9 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
             raise FileNotFoundError(f"File {file_path} not found on server")
 
         with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-            total_rows = sum(1 for _ in f) - 1  # Exclude header
+            reader = csv.reader(f)
+            next(reader, None)  # Exclude header
+            total_rows = sum(1 for _ in reader)
             total_rows = max(0, total_rows)
 
         with get_sync_db() as db:
@@ -241,13 +243,15 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
                         {"import_id": imp_id, "row_num": r_num, "error_msg": err_msg, "raw_data": raw_d[:500]},
                     )
 
-        # 5. Stage 3: In-Database Deduplication
+        # 5. Stage 3: In-Database Deduplication with optimized work_mem and sequential chunking
         publish_progress(
             r, job_id_str, "IMPORTING", 65, processed_rows, total_rows, successful_rows, failed_rows, "Deduplicating duplicate SKUs in database..."
         )
 
         with sync_engine.connect() as conn:
             with conn.begin():
+                # Elevate work_mem for this transaction so the 500K-row sort runs in-memory instead of spilling to disk
+                conn.execute(text("SET LOCAL work_mem = '64MB';"))
                 # Deduplicate: later occurrence (higher row_num) replaces earlier occurrence
                 conn.execute(
                     text(
@@ -260,30 +264,92 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
                         """
                     )
                 )
+                # Add sequential serial column for fast indexed chunking
+                conn.execute(text(f"ALTER TABLE {dedup_table} ADD COLUMN chunk_id SERIAL PRIMARY KEY;"))
+                # Drop staging table immediately to reclaim storage
+                conn.execute(text(f"DROP TABLE IF EXISTS {staging_table};"))
 
-        # 6. Stage 4: Atomic Set-Based UPSERT into products table
-        publish_progress(
-            r, job_id_str, "IMPORTING", 75, processed_rows, total_rows, successful_rows, failed_rows, "Upserting products into main table..."
-        )
+        # 6. Stage 4: Chunked Set-Based UPSERT into products table with continuous live telemetry
+        with sync_engine.connect() as conn:
+            res = conn.execute(text(f"SELECT COUNT(*), COALESCE(MAX(chunk_id), 0) FROM {dedup_table};")).fetchone()
+            dedup_count = res[0] if res else 0
+            max_chunk_id = res[1] if res else 0
 
+        logger.info(f"Deduplicated to {dedup_count:,} unique products. Starting chunked upsert across {max_chunk_id} IDs...")
+
+        UPSERT_CHUNK_SIZE = 25000
+        num_batches = max(1, (max_chunk_id + UPSERT_CHUNK_SIZE - 1) // UPSERT_CHUNK_SIZE)
+        current_batch = 0
+
+        for b_start in range(1, max_chunk_id + 1, UPSERT_CHUNK_SIZE):
+            current_batch += 1
+            b_end = b_start + UPSERT_CHUNK_SIZE
+
+            with sync_engine.connect() as batch_conn:
+                with batch_conn.begin():
+                    # Notice: 'active' is intentionally excluded from DO UPDATE SET, preserving existing status!
+                    batch_conn.execute(
+                        text(
+                            f"""
+                            INSERT INTO products (sku, name, description, active, created_at, updated_at)
+                            SELECT sku, name, description, TRUE, NOW(), NOW()
+                            FROM {dedup_table}
+                            WHERE chunk_id >= :b_start AND chunk_id < :b_end
+                            ON CONFLICT (lower(sku)) DO UPDATE SET
+                                name = EXCLUDED.name,
+                                description = EXCLUDED.description,
+                                updated_at = NOW();
+                            """
+                        ),
+                        {"b_start": b_start, "b_end": b_end},
+                    )
+
+            # Continuous live progress telemetry scaled between 70% and 98%
+            current_processed_count = min(current_batch * UPSERT_CHUNK_SIZE, dedup_count)
+            progress_pct = int(70 + (current_batch / num_batches) * 28)
+            stage_msg = f"Merging products into catalogue ({current_processed_count:,} / {dedup_count:,})..."
+
+            publish_progress(
+                r,
+                job_id_str,
+                "IMPORTING",
+                progress_pct,
+                processed_rows,
+                total_rows,
+                successful_rows,
+                failed_rows,
+                stage_msg,
+            )
+
+            # Sync intermediate progress to PostgreSQL database so refreshing the page never shows stale state
+            if current_batch % 2 == 0 or current_batch == num_batches:
+                try:
+                    with get_sync_db() as db:
+                        db.execute(
+                            text(
+                                """
+                                UPDATE import_jobs
+                                SET progress = :progress,
+                                    stage_message = :stage_msg,
+                                    processed_rows = :processed,
+                                    successful_rows = :successful
+                                WHERE id = :id
+                                """
+                            ),
+                            {
+                                "id": job_id_str,
+                                "progress": progress_pct,
+                                "stage_msg": stage_msg,
+                                "processed": processed_rows,
+                                "successful": successful_rows,
+                            },
+                        )
+                except Exception:
+                    pass
+
+        # Cleanup dedup table
         with sync_engine.connect() as conn:
             with conn.begin():
-                # Notice: 'active' is intentionally excluded from DO UPDATE SET, preserving existing status!
-                conn.execute(
-                    text(
-                        f"""
-                        INSERT INTO products (sku, name, description, active, created_at, updated_at)
-                        SELECT sku, name, description, TRUE, NOW(), NOW()
-                        FROM {dedup_table}
-                        ON CONFLICT (lower(sku)) DO UPDATE SET
-                            name = EXCLUDED.name,
-                            description = EXCLUDED.description,
-                            updated_at = NOW();
-                        """
-                    )
-                )
-                # Cleanup temporary unlogged tables
-                conn.execute(text(f"DROP TABLE IF EXISTS {staging_table};"))
                 conn.execute(text(f"DROP TABLE IF EXISTS {dedup_table};"))
 
         # 7. Finalize Job

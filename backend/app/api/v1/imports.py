@@ -121,24 +121,35 @@ async def stream_import_progress(
     """
     import_id_str = str(import_id)
 
-    # 1. Fetch initial status from database
-    stmt = select(ImportJob).where(ImportJob.id == import_id)
-    result = await db.execute(stmt)
-    job = result.scalar_one_or_none()
-    if not job:
-        raise ImportNotFoundException(import_id_str)
+    # 1. Fetch initial status: check Redis cache first, then fallback to database
+    initial_payload = None
+    r = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+    try:
+        cached_raw = await r.get(f"import_latest:{import_id_str}")
+        if cached_raw:
+            initial_payload = json.loads(cached_raw)
+    except Exception:
+        pass
 
-    initial_payload = {
-        "import_id": import_id_str,
-        "status": job.status,
-        "progress": job.progress,
-        "processed_rows": job.processed_rows,
-        "total_rows": job.total_rows,
-        "successful_rows": job.successful_rows,
-        "failed_rows": job.failed_rows,
-        "stage_message": job.stage_message,
-        "error_message": job.error_message,
-    }
+    if not initial_payload:
+        stmt = select(ImportJob).where(ImportJob.id == import_id)
+        result = await db.execute(stmt)
+        job = result.scalar_one_or_none()
+        if not job:
+            await r.aclose()
+            raise ImportNotFoundException(import_id_str)
+
+        initial_payload = {
+            "import_id": import_id_str,
+            "status": job.status,
+            "progress": job.progress,
+            "processed_rows": job.processed_rows,
+            "total_rows": job.total_rows,
+            "successful_rows": job.successful_rows,
+            "failed_rows": job.failed_rows,
+            "stage_message": job.stage_message,
+            "error_message": job.error_message,
+        }
 
     async def sse_event_generator():
         # Yield current initial state immediately
@@ -146,21 +157,21 @@ async def stream_import_progress(
 
         # If already completed or failed, terminate stream immediately
         if initial_payload["status"] in ("COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED"):
+            await r.aclose()
             return
 
         # Connect to Redis Pub/Sub
-        r = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
         pubsub = r.pubsub()
         channel = f"import_progress:{import_id_str}"
         await pubsub.subscribe(channel)
 
         try:
             while True:
-                # Wait for pubsub message or send heartbeat ping every 15s
+                # Wait for pubsub message or send heartbeat ping every 5s to keep proxy alive
                 try:
                     message = await asyncio.wait_for(
                         pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0),
-                        timeout=15.0,
+                        timeout=5.0,
                     )
                 except asyncio.TimeoutError:
                     # Heartbeat comment to keep connection alive through reverse proxies

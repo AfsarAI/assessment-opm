@@ -57,12 +57,28 @@ async function handleResponse<T>(res: Response): Promise<T> {
 // ----------------------------------------------------
 // Health Check
 // ----------------------------------------------------
-export async function getHealth(): Promise<{ status: string; database?: string; redis?: string }> {
+export async function getHealth(): Promise<{ status: "ok" | "waking" | "offline"; database?: string; redis?: string }> {
   try {
     const rootUrl = API_BASE_URL.replace(/\/api\/v1\/?$/, "");
-    const res = await fetch(`${rootUrl}/ready`, { cache: "no-store" });
-    return handleResponse(res);
-  } catch {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000);
+    const res = await fetch(`${rootUrl}/ready`, {
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    if (res.ok) {
+      const data = await res.json();
+      return { status: "ok", database: data.database, redis: data.redis };
+    }
+    if ([502, 503, 504].includes(res.status)) {
+      return { status: "waking" };
+    }
+    return { status: "offline" };
+  } catch (err: any) {
+    if (err.name === "AbortError" || err.message?.includes("Failed to fetch") || err.message?.includes("NetworkError")) {
+      return { status: "waking" };
+    }
     return { status: "offline" };
   }
 }
@@ -146,15 +162,53 @@ export async function deleteAllProducts(): Promise<{ success: boolean; message: 
 // ----------------------------------------------------
 // Imports API
 // ----------------------------------------------------
-export async function uploadCsv(file: File): Promise<{ import_id: string; status: string; message: string }> {
-  const formData = new FormData();
-  formData.append("file", file);
+export async function uploadCsv(
+  file: File,
+  onProgress?: (percent: number, loadedBytes: number, totalBytes: number) => void
+): Promise<{ import_id: string; status: string; message: string; filename?: string }> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${API_BASE_URL}/imports`);
 
-  const res = await fetch(`${API_BASE_URL}/imports`, {
-    method: "POST",
-    body: formData,
+    if (onProgress && xhr.upload) {
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) {
+          const percent = Math.round((event.loaded / event.total) * 100);
+          onProgress(percent, event.loaded, event.total);
+        }
+      };
+    }
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          const data = JSON.parse(xhr.responseText);
+          resolve(data);
+        } catch {
+          resolve({ import_id: "", status: "QUEUED", message: "Upload accepted" });
+        }
+      } else {
+        let msg = `Upload failed with status ${xhr.status}`;
+        try {
+          const err = JSON.parse(xhr.responseText);
+          if (err.error?.message) msg = err.error.message;
+        } catch {}
+        reject(new ApiError(msg, "UPLOAD_ERROR", xhr.status));
+      }
+    };
+
+    xhr.onerror = () => {
+      reject(new ApiError("Network error during file upload. Check your internet connection.", "NETWORK_ERROR", 0));
+    };
+
+    xhr.ontimeout = () => {
+      reject(new ApiError("Upload request timed out.", "TIMEOUT_ERROR", 408));
+    };
+
+    const formData = new FormData();
+    formData.append("file", file);
+    xhr.send(formData);
   });
-  return handleResponse<{ import_id: string; status: string; message: string }>(res);
 }
 
 export async function getImports(limit: number = 10): Promise<ImportJob[]> {

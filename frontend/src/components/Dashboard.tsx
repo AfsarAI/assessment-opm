@@ -11,8 +11,9 @@ import {
   Database,
   Cpu,
   Zap,
+  RefreshCw,
 } from "lucide-react";
-import { getProducts, getImports, getWebhooks } from "@/lib/api";
+import { getProducts, getImports, getWebhooks, getHealth } from "@/lib/api";
 
 interface DashboardProps {
   onNavigate: (tab: "dashboard" | "products" | "imports" | "webhooks") => void;
@@ -27,18 +28,26 @@ export const Dashboard: React.FC<DashboardProps> = ({ onNavigate }) => {
     webhooksCount: 0,
   });
   const [loading, setLoading] = useState(true);
+  const [isWaking, setIsWaking] = useState(false);
 
-  useEffect(() => {
-    const loadTelemetry = async () => {
-      try {
-        const [allRes, activeRes, inactiveRes, imports, webhooks] = await Promise.allSettled([
-          getProducts({ limit: 1 }),
-          getProducts({ limit: 1, status: "active" }),
-          getProducts({ limit: 1, status: "inactive" }),
-          getImports(10),
-          getWebhooks(),
-        ]);
+  const loadTelemetry = async () => {
+    try {
+      const [allRes, activeRes, inactiveRes, imports, webhooks] = await Promise.allSettled([
+        getProducts({ limit: 1 }),
+        getProducts({ limit: 1, status: "active" }),
+        getProducts({ limit: 1, status: "inactive" }),
+        getImports(10),
+        getWebhooks(),
+      ]);
 
+      const allFailed = allRes.status === "rejected" && imports.status === "rejected";
+      if (allFailed) {
+        const health = await getHealth();
+        if (health.status === "waking" || health.status === "offline") {
+          setIsWaking(true);
+        }
+      } else {
+        setIsWaking(false);
         const total = allRes.status === "fulfilled" ? allRes.value.pagination.total : 0;
         const active = activeRes.status === "fulfilled" ? activeRes.value.pagination.total : 0;
         const inactive = inactiveRes.status === "fulfilled" ? inactiveRes.value.pagination.total : 0;
@@ -46,13 +55,24 @@ export const Dashboard: React.FC<DashboardProps> = ({ onNavigate }) => {
         const webhooksCount = webhooks.status === "fulfilled" ? webhooks.value.filter((w) => w.enabled).length : 0;
 
         setStats({ total, active, inactive, importsCount, webhooksCount });
-      } finally {
-        setLoading(false);
       }
-    };
+    } finally {
+      setLoading(false);
+    }
+  };
 
+  useEffect(() => {
     loadTelemetry();
   }, []);
+
+  // Automatic retry if backend was sleeping on initial visit
+  useEffect(() => {
+    if (!isWaking) return;
+    const interval = setInterval(() => {
+      loadTelemetry();
+    }, 4000);
+    return () => clearInterval(interval);
+  }, [isWaking]);
 
   return (
     <div className="space-y-8">
@@ -84,6 +104,21 @@ export const Dashboard: React.FC<DashboardProps> = ({ onNavigate }) => {
           </div>
         </div>
       </div>
+
+      {isWaking && (
+        <div className="flex items-center justify-between rounded-xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
+          <div className="flex items-center gap-2.5">
+            <RefreshCw className="h-4 w-4 animate-spin text-amber-600" />
+            <span>Backend server is currently spinning up from sleep (~50s on Render Free tier). Telemetry and metrics will load automatically...</span>
+          </div>
+          <button
+            onClick={() => loadTelemetry()}
+            className="rounded-md bg-amber-200 px-3 py-1 text-xs font-semibold text-amber-900 hover:bg-amber-300 transition-colors"
+          >
+            Retry Now
+          </button>
+        </div>
+      )}
 
       {/* Metric Cards Grid */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
