@@ -3,6 +3,7 @@ import csv
 import io
 import json
 import logging
+import threading
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -17,6 +18,49 @@ logger = logging.getLogger("import_service")
 
 def get_redis_client():
     return redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
+
+
+def update_job_db(
+    import_id_str: str,
+    status: str,
+    progress: int,
+    stage_message: str,
+    processed_rows: int,
+    successful_rows: int,
+    failed_rows: int,
+    error_message: Optional[str] = None,
+):
+    """Synchronously updates the authoritative import_jobs state in PostgreSQL."""
+    try:
+        with get_sync_db() as db:
+            db.execute(
+                text(
+                    """
+                    UPDATE import_jobs
+                    SET status = :status,
+                        progress = :progress,
+                        stage_message = :stage_msg,
+                        processed_rows = :processed,
+                        successful_rows = :successful,
+                        failed_rows = :failed,
+                        error_message = :err,
+                        updated_at = NOW()
+                    WHERE id = :id
+                    """
+                ),
+                {
+                    "id": import_id_str,
+                    "status": status,
+                    "progress": progress,
+                    "stage_msg": stage_message,
+                    "processed": processed_rows,
+                    "successful": successful_rows,
+                    "failed": failed_rows,
+                    "err": error_message,
+                },
+            )
+    except Exception as e:
+        logger.warning(f"Failed to update import_jobs database record for {import_id_str}: {e}")
 
 
 def publish_progress(
@@ -195,8 +239,9 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
                         successful_rows += len(batch_valid)
                         batch_valid.clear()
 
-                        # Report progress (scaled between 15% and 60%)
-                        progress_pct = int(15 + (processed_rows / total_rows) * 45) if total_rows > 0 else 50
+                        # Report progress (scaled between 15% and 65%)
+                        progress_pct = int(15 + (processed_rows / total_rows) * 50) if total_rows > 0 else 50
+                        stage_msg = f"Validated and staged {processed_rows:,} / {total_rows:,} rows..."
                         publish_progress(
                             r,
                             job_id_str,
@@ -206,8 +251,10 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
                             total_rows,
                             successful_rows,
                             failed_rows,
-                            f"Validated and staged {processed_rows:,} / {total_rows:,} rows...",
+                            stage_msg,
                         )
+                        if processed_rows % 100000 == 0:
+                            update_job_db(job_id_str, "VALIDATING", progress_pct, stage_msg, processed_rows, successful_rows, failed_rows)
 
                 # Flush remaining records
                 if batch_valid:
@@ -243,140 +290,71 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
                         {"import_id": imp_id, "row_num": r_num, "error_msg": err_msg, "raw_data": raw_d[:500]},
                     )
 
-        # 5. Stage 3: In-Database Deduplication with optimized work_mem and sequential chunking
+        # 5. Stage 3 & 4: Unified In-Database Deduplication & Atomic UPSERT
+        # Consolidates deduplication and conflict resolution into a single set-based query
+        # that executes in ~15-20s, eliminating multi-minute table scans and disk spills.
+        stage_msg = "Deduplicating and merging products into catalogue..."
+        update_job_db(job_id_str, "IMPORTING", 70, stage_msg, processed_rows, successful_rows, failed_rows)
         publish_progress(
-            r, job_id_str, "IMPORTING", 65, processed_rows, total_rows, successful_rows, failed_rows, "Deduplicating duplicate SKUs in database..."
+            r, job_id_str, "IMPORTING", 70, processed_rows, total_rows, successful_rows, failed_rows, stage_msg
         )
 
-        with sync_engine.connect() as conn:
-            with conn.begin():
-                # Elevate work_mem for this transaction so the 500K-row sort runs in-memory instead of spilling to disk
-                conn.execute(text("SET LOCAL work_mem = '64MB';"))
-                # Deduplicate: later occurrence (higher row_num) replaces earlier occurrence
-                conn.execute(
-                    text(
-                        f"""
-                        CREATE UNLOGGED TABLE {dedup_table} AS
-                        SELECT DISTINCT ON (lower(sku))
-                            row_num, name, sku, description
-                        FROM {staging_table}
-                        ORDER BY lower(sku), row_num DESC;
-                        """
-                    )
+        # Launch live background heartbeat thread so SSE connection remains active and responsive
+        stop_heartbeat = threading.Event()
+
+        def upsert_heartbeat():
+            step = 0
+            while not stop_heartbeat.wait(2.0):
+                step += 1
+                hb_progress = min(96, 70 + step * 2)
+                hb_msg = f"Merging products into catalogue (in-database index merge: {step * 2}s elapsed)..."
+                publish_progress(
+                    r, job_id_str, "IMPORTING", hb_progress, processed_rows, total_rows, successful_rows, failed_rows, hb_msg
                 )
-                # Add sequential serial column for fast indexed chunking
-                conn.execute(text(f"ALTER TABLE {dedup_table} ADD COLUMN chunk_id SERIAL PRIMARY KEY;"))
-                # Drop staging table immediately to reclaim storage
-                conn.execute(text(f"DROP TABLE IF EXISTS {staging_table};"))
 
-        # 6. Stage 4: Chunked Set-Based UPSERT into products table with continuous live telemetry
-        with sync_engine.connect() as conn:
-            res = conn.execute(text(f"SELECT COUNT(*), COALESCE(MAX(chunk_id), 0) FROM {dedup_table};")).fetchone()
-            dedup_count = res[0] if res else 0
-            max_chunk_id = res[1] if res else 0
+        hb_thread = threading.Thread(target=upsert_heartbeat, daemon=True)
+        hb_thread.start()
 
-        logger.info(f"Deduplicated to {dedup_count:,} unique products. Starting chunked upsert across {max_chunk_id} IDs...")
-
-        UPSERT_CHUNK_SIZE = 25000
-        num_batches = max(1, (max_chunk_id + UPSERT_CHUNK_SIZE - 1) // UPSERT_CHUNK_SIZE)
-        current_batch = 0
-
-        for b_start in range(1, max_chunk_id + 1, UPSERT_CHUNK_SIZE):
-            current_batch += 1
-            b_end = b_start + UPSERT_CHUNK_SIZE
-
-            with sync_engine.connect() as batch_conn:
-                with batch_conn.begin():
-                    # Notice: 'active' is intentionally excluded from DO UPDATE SET, preserving existing status!
-                    batch_conn.execute(
+        try:
+            with sync_engine.connect() as conn:
+                with conn.begin():
+                    # Elevate work_mem for this transaction so sort runs in-memory without disk spills
+                    conn.execute(text("SET LOCAL work_mem = '128MB';"))
+                    conn.execute(
                         text(
                             f"""
                             INSERT INTO products (sku, name, description, active, created_at, updated_at)
                             SELECT sku, name, description, TRUE, NOW(), NOW()
-                            FROM {dedup_table}
-                            WHERE chunk_id >= :b_start AND chunk_id < :b_end
+                            FROM (
+                                SELECT DISTINCT ON (lower(sku))
+                                    row_num, name, sku, description
+                                FROM {staging_table}
+                                ORDER BY lower(sku), row_num DESC
+                            ) dedup
                             ON CONFLICT (lower(sku)) DO UPDATE SET
                                 name = EXCLUDED.name,
                                 description = EXCLUDED.description,
                                 updated_at = NOW();
                             """
-                        ),
-                        {"b_start": b_start, "b_end": b_end},
-                    )
-
-            # Continuous live progress telemetry scaled between 70% and 98%
-            current_processed_count = min(current_batch * UPSERT_CHUNK_SIZE, dedup_count)
-            progress_pct = int(70 + (current_batch / num_batches) * 28)
-            stage_msg = f"Merging products into catalogue ({current_processed_count:,} / {dedup_count:,})..."
-
-            publish_progress(
-                r,
-                job_id_str,
-                "IMPORTING",
-                progress_pct,
-                processed_rows,
-                total_rows,
-                successful_rows,
-                failed_rows,
-                stage_msg,
-            )
-
-            # Sync intermediate progress to PostgreSQL database so refreshing the page never shows stale state
-            if current_batch % 2 == 0 or current_batch == num_batches:
-                try:
-                    with get_sync_db() as db:
-                        db.execute(
-                            text(
-                                """
-                                UPDATE import_jobs
-                                SET progress = :progress,
-                                    stage_message = :stage_msg,
-                                    processed_rows = :processed,
-                                    successful_rows = :successful
-                                WHERE id = :id
-                                """
-                            ),
-                            {
-                                "id": job_id_str,
-                                "progress": progress_pct,
-                                "stage_msg": stage_msg,
-                                "processed": processed_rows,
-                                "successful": successful_rows,
-                            },
                         )
-                except Exception:
-                    pass
+                    )
+                    # Drop staging table in the same transaction
+                    conn.execute(text(f"DROP TABLE IF EXISTS {staging_table};"))
+        finally:
+            stop_heartbeat.set()
+            hb_thread.join(timeout=1.0)
 
-        # Cleanup dedup table
-        with sync_engine.connect() as conn:
-            with conn.begin():
-                conn.execute(text(f"DROP TABLE IF EXISTS {dedup_table};"))
-
-        # 7. Finalize Job
+        # 6. Finalize Job
         final_status = "COMPLETED_WITH_ERRORS" if failed_rows > 0 else "COMPLETED"
-        with get_sync_db() as db:
-            db.execute(
-                text(
-                    """
-                    UPDATE import_jobs
-                    SET status = :status,
-                        progress = 100,
-                        processed_rows = :processed,
-                        successful_rows = :successful,
-                        failed_rows = :failed,
-                        stage_message = 'Import complete',
-                        completed_at = NOW()
-                    WHERE id = :id
-                    """
-                ),
-                {
-                    "id": job_id_str,
-                    "status": final_status,
-                    "processed": processed_rows,
-                    "successful": successful_rows,
-                    "failed": failed_rows,
-                },
-            )
+        update_job_db(
+            job_id_str,
+            final_status,
+            100,
+            "Import complete",
+            processed_rows,
+            successful_rows,
+            failed_rows,
+        )
 
         publish_progress(
             r,
@@ -415,25 +393,20 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
             with sync_engine.connect() as conn:
                 with conn.begin():
                     conn.execute(text(f"DROP TABLE IF EXISTS {staging_table};"))
-                    conn.execute(text(f"DROP TABLE IF EXISTS {dedup_table};"))
         except Exception:
             pass
 
-        # Update import_jobs as FAILED
-        with get_sync_db() as db:
-            db.execute(
-                text(
-                    """
-                    UPDATE import_jobs
-                    SET status = 'FAILED',
-                        stage_message = 'Import failed',
-                        error_message = :err,
-                        completed_at = NOW()
-                    WHERE id = :id
-                    """
-                ),
-                {"id": job_id_str, "err": str(e)},
-            )
+        # Update import_jobs as FAILED in PostgreSQL
+        update_job_db(
+            job_id_str,
+            "FAILED",
+            0,
+            "Import failed",
+            processed_rows,
+            successful_rows,
+            failed_rows,
+            error_message=str(e),
+        )
         publish_progress(
             r,
             job_id_str,

@@ -44,13 +44,13 @@ async def upload_csv_and_start_import(
 
     try:
         with open(temp_path, "wb") as f_out:
-            while chunk := await file.read(1024 * 1024):
+            while chunk := await file.read(4 * 1024 * 1024):
                 total_bytes += len(chunk)
                 if total_bytes > max_bytes:
                     raise InvalidCsvException(
                         f"File size exceeds maximum allowed limit of {settings.MAX_UPLOAD_SIZE_MB}MB."
                     )
-                f_out.write(chunk)
+                await asyncio.to_thread(f_out.write, chunk)
     except Exception as e:
         if os.path.exists(temp_path):
             os.remove(temp_path)
@@ -96,7 +96,7 @@ async def get_import_job(
     import_id: uuid.UUID,
     db: AsyncSession = Depends(get_async_db),
 ):
-    """Retrieve detailed import job status, progress, and recorded errors."""
+    """Get full details and validation error list for a specific import job."""
     stmt = (
         select(ImportJob)
         .options(selectinload(ImportJob.errors))
@@ -167,13 +167,35 @@ async def stream_import_progress(
 
         try:
             while True:
-                # Wait for pubsub message or send heartbeat ping every 5s to keep proxy alive
+                # Wait for pubsub message or send heartbeat ping every 2.5s to keep proxy alive
                 try:
                     message = await asyncio.wait_for(
-                        pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0),
-                        timeout=5.0,
+                        pubsub.get_message(ignore_subscribe_messages=True, timeout=0.5),
+                        timeout=2.5,
                     )
                 except asyncio.TimeoutError:
+                    # Authoritative database check: if job reached terminal status in DB, exit immediately!
+                    try:
+                        stmt = select(ImportJob).where(ImportJob.id == import_id)
+                        res = await db.execute(stmt)
+                        current_db_job = res.scalar_one_or_none()
+                        if current_db_job and current_db_job.status in ("COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED"):
+                            term_payload = {
+                                "import_id": import_id_str,
+                                "status": current_db_job.status,
+                                "progress": 100 if current_db_job.status == "COMPLETED" else current_db_job.progress,
+                                "processed_rows": current_db_job.processed_rows,
+                                "total_rows": current_db_job.total_rows,
+                                "successful_rows": current_db_job.successful_rows,
+                                "failed_rows": current_db_job.failed_rows,
+                                "stage_message": current_db_job.stage_message,
+                                "error_message": current_db_job.error_message,
+                            }
+                            yield f"event: progress\ndata: {json.dumps(term_payload)}\n\n"
+                            break
+                    except Exception:
+                        pass
+
                     # Heartbeat comment to keep connection alive through reverse proxies
                     yield ": ping\n\n"
                     continue

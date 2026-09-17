@@ -43,6 +43,9 @@ async def test_upload_csv_creates_queued_job(client: AsyncClient, db_session: As
 
 @pytest.mark.asyncio
 async def test_execute_import_pipeline_end_to_end(client: AsyncClient, db_session: AsyncSession, tmp_path):
+    await db_session.execute(text("TRUNCATE TABLE products RESTART IDENTITY;"))
+    await db_session.commit()
+
     # 1. Create temporary CSV with duplicates and case variants
     csv_file = tmp_path / "test_import.csv"
     content = (

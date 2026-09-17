@@ -46,6 +46,7 @@ export const ImportManager: React.FC = () => {
   const connectSse = (jobId: string) => {
     if (eventSourceRef.current) {
       eventSourceRef.current.close();
+      eventSourceRef.current = null;
     }
     if (fallbackPollRef.current) {
       clearInterval(fallbackPollRef.current);
@@ -55,6 +56,18 @@ export const ImportManager: React.FC = () => {
     const sseUrl = getImportProgressUrl(jobId);
     const es = new EventSource(sseUrl);
     eventSourceRef.current = es;
+
+    const handleTerminalStatus = () => {
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
+      if (fallbackPollRef.current) {
+        clearInterval(fallbackPollRef.current);
+        fallbackPollRef.current = null;
+      }
+      loadRecentJobs();
+    };
 
     es.addEventListener("progress", (event) => {
       try {
@@ -93,12 +106,7 @@ export const ImportManager: React.FC = () => {
         );
 
         if (["COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED"].includes(data.status)) {
-          es.close();
-          if (fallbackPollRef.current) {
-            clearInterval(fallbackPollRef.current);
-            fallbackPollRef.current = null;
-          }
-          loadRecentJobs();
+          handleTerminalStatus();
         }
       } catch (err) {
         console.error("Failed to parse SSE event:", err);
@@ -106,25 +114,29 @@ export const ImportManager: React.FC = () => {
     });
 
     es.onerror = () => {
-      es.close();
-      // Start fallback polling if SSE connection drops
-      if (!fallbackPollRef.current) {
-        fallbackPollRef.current = setInterval(async () => {
-          try {
-            const current = await getImport(jobId);
-            setActiveJob(current);
-            setRecentJobs((prev) => prev.map((j) => (j.id === jobId ? current : j)));
-            if (["COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED"].includes(current.status)) {
-              if (fallbackPollRef.current) {
-                clearInterval(fallbackPollRef.current);
-                fallbackPollRef.current = null;
-              }
-              loadRecentJobs();
-            }
-          } catch {}
-        }, 2000);
-      }
+      // SSE connection dropped; watchdog polling will maintain state
     };
+
+    // Authoritative background watchdog poll every 2.5s:
+    // Guarantees UI completion even if reverse proxies drop SSE or network fluctuates
+    fallbackPollRef.current = setInterval(async () => {
+      try {
+        const current = await getImport(jobId);
+        if (["COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED"].includes(current.status)) {
+          setActiveJob(current);
+          setRecentJobs((prev) => prev.map((j) => (j.id === jobId ? current : j)));
+          handleTerminalStatus();
+        } else {
+          setActiveJob((prev) => {
+            if (!prev) return current;
+            if (current.progress > prev.progress || current.status !== prev.status) {
+              return { ...prev, ...current };
+            }
+            return prev;
+          });
+        }
+      } catch {}
+    }, 2500);
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -291,15 +303,34 @@ export const ImportManager: React.FC = () => {
 
           <div className="mt-6">
             <div className="flex justify-between text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-2">
-              <span>{activeJob.stage_message}</span>
-              <span>{activeJob.progress}%</span>
+              <span className="flex items-center gap-2">
+                {activeJob.status === "IMPORTING" && (
+                  <RefreshCw className="h-3.5 w-3.5 animate-spin text-indigo-600 dark:text-indigo-400" />
+                )}
+                {activeJob.stage_message}
+              </span>
+              <span className="font-semibold">{activeJob.progress}%</span>
             </div>
             <div className="h-3 w-full overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-800">
               <div
-                className="h-full bg-indigo-600 transition-all duration-300 ease-out"
+                className={`h-full transition-all duration-300 ease-out ${
+                  activeJob.status === "COMPLETED"
+                    ? "bg-emerald-500"
+                    : activeJob.status === "FAILED"
+                    ? "bg-rose-500"
+                    : activeJob.status === "IMPORTING"
+                    ? "bg-indigo-600 animate-pulse"
+                    : "bg-indigo-600"
+                }`}
                 style={{ width: `${Math.max(activeJob.progress, 3)}%` }}
               />
             </div>
+            {activeJob.status === "IMPORTING" && (
+              <p className="mt-2 text-xs text-indigo-700 dark:text-indigo-300 flex items-center gap-1.5">
+                <span className="inline-block h-1.5 w-1.5 rounded-full bg-indigo-500 animate-ping" />
+                PostgreSQL is executing unified deduplication and atomic catalogue merge in background (~15-20s). Do not refresh.
+              </p>
+            )}
           </div>
 
           <div className="mt-6 grid grid-cols-2 gap-4 sm:grid-cols-4">
