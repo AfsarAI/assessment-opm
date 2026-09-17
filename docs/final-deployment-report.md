@@ -89,3 +89,28 @@ docker exec opm_backend pytest tests/ -v
 ```
 
 All 22 tests covering health checks, upload validation, Celery execution, deduplication, active status preservation, SSE streaming, product CRUD, case-insensitive duplicate SKU conflict, pagination, bulk delete, and webhook SSRF passed.
+
+---
+
+## 8. Live Production Deployment & End-to-End Verification
+
+### Verified Live Endpoints
+- **Production Frontend (Vercel)**: [https://assessment-opm.vercel.app/](https://assessment-opm.vercel.app/)
+- **Production Backend API (Render)**: [https://opm-backend-p1i8.onrender.com](https://opm-backend-p1i8.onrender.com)
+- **OpenAPI / Swagger Interactive Documentation**: [https://opm-backend-p1i8.onrender.com/docs](https://opm-backend-p1i8.onrender.com/docs)
+- **Readiness Check (PostgreSQL & Redis)**: [https://opm-backend-p1i8.onrender.com/ready](https://opm-backend-p1i8.onrender.com/ready)
+- **Liveness Check**: [https://opm-backend-p1i8.onrender.com/health](https://opm-backend-p1i8.onrender.com/health)
+
+### Verification Matrix on Public HTTPS
+
+| Test Scenario | Action Performed | Live Output / Verification | Status |
+| :--- | :--- | :--- | :--- |
+| **Liveness & Readiness** | Probed `/health` and `/ready` | `status: ok`, `database: healthy`, `redis: healthy` | **PASSED** |
+| **CORS Preflight** | `OPTIONS` on `/api/v1/products` with Vercel origin | Returns `access-control-allow-origin: https://assessment-opm.vercel.app` | **PASSED** |
+| **Product CRUD** | Created `PROD-TEST-LIVE-01`, updated via `PATCH` | Product ID 1 created, retrieved, and updated | **PASSED** |
+| **Case-Insensitive Search** | Queried `sku=prod-test` | Case-insensitive functional index matches `PROD-TEST-LIVE-01` | **PASSED** |
+| **Webhook Delivery** | Registered webhook to `https://httpbin.org/post` & triggered test | HTTP 200 delivered in 495ms with HMAC signature | **PASSED** |
+| **Background CSV Ingestion** | Uploaded `products_100.csv` to live backend | Celery worker completed 100 rows in 152ms via COPY protocol | **PASSED** |
+| **Active Status Preservation** | Set `active=false` on product, re-imported CSV | `updated_at` updated, `active=false` preserved unchanged | **PASSED** |
+| **Frontend UI Navigation** | Automated browser session across Dashboard, Products, Ingestion, Webhooks | All pages loaded cleanly; "API Online" badge green; 0 console errors | **PASSED** |
+
