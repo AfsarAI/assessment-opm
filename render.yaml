@@ -1,0 +1,48 @@
+# Render Blueprint for Assessment OPM ($0.00 Free Tier Deployment)
+# See: https://render.com/docs/blueprint-spec
+
+version: "1"
+
+services:
+  # Unified Production Backend (FastAPI + Celery Worker + Embedded Redis)
+  - type: web
+    name: opm-backend
+    runtime: docker
+    dockerfilePath: backend/Dockerfile
+    dockerContext: backend
+    plan: free
+    region: oregon
+    healthCheckPath: /health
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: SERVICE_TYPE
+        value: all
+      - key: DATABASE_URL
+        fromDatabase:
+          name: opm-database
+          property: connectionString
+      - key: SYNC_DATABASE_URL
+        fromDatabase:
+          name: opm-database
+          property: connectionString
+      - key: REDIS_URL
+        value: redis://127.0.0.1:6379/0
+      - key: CELERY_BROKER_URL
+        value: redis://127.0.0.1:6379/0
+      - key: CELERY_RESULT_BACKEND
+        value: redis://127.0.0.1:6379/0
+      - key: CORS_ORIGINS
+        value: "*"
+      - key: MAX_UPLOAD_SIZE_MB
+        value: 250
+      - key: LOG_LEVEL
+        value: INFO
+
+databases:
+  # Free PostgreSQL 16 Instance (1 GB Storage, 50 Connections)
+  - name: opm-database
+    plan: free
+    region: oregon
+    databaseName: opm_db
+    user: opm_user

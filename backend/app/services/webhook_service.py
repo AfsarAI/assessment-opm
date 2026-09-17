@@ -115,7 +115,7 @@ class WebhookService:
 
         start_time = time.perf_counter()
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
                 resp = await client.post(webhook.url, json=payload, headers=headers)
                 elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
                 body_snippet = resp.text[:300] if resp.text else ""

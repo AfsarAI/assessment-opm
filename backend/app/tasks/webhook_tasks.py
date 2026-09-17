@@ -56,9 +56,18 @@ def deliver_webhook(self, webhook_id: str, url: str, event_type: str, payload: d
         "X-Webhook-Timestamp": str(int(time.time())),
     }
 
+    body_obj = {"event": event_type, "payload": payload}
+    if secret:
+        import hmac
+        import hashlib
+        import json
+        body_bytes = json.dumps(body_obj).encode("utf-8")
+        signature = hmac.new(secret.encode("utf-8"), body_bytes, hashlib.sha256).hexdigest()
+        headers["X-Webhook-Signature"] = f"sha256={signature}"
+
     try:
-        with httpx.Client(timeout=5.0) as client:
-            resp = client.post(url, json={"event": event_type, "payload": payload}, headers=headers)
+        with httpx.Client(timeout=5.0, follow_redirects=False) as client:
+            resp = client.post(url, json=body_obj, headers=headers)
             resp.raise_for_status()
             logger.info(f"Webhook {webhook_id} delivered successfully with status {resp.status_code}")
             return {"status": "success", "status_code": resp.status_code}

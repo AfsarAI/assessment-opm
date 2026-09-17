@@ -1,0 +1,96 @@
+name: Assessment OPM CI Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  backend-tests:
+    name: Backend Tests & Migration Audit
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: opm_user
+          POSTGRES_PASSWORD: opm_password
+          POSTGRES_DB: opm_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+
+      - name: Run Alembic Migrations
+        env:
+          DATABASE_URL: postgresql+asyncpg://opm_user:opm_password@localhost:5432/opm_db
+          SYNC_DATABASE_URL: postgresql+psycopg://opm_user:opm_password@localhost:5432/opm_db
+        run: |
+          cd backend
+          alembic upgrade head
+
+      - name: Run Pytest Test Suite
+        env:
+          DATABASE_URL: postgresql+asyncpg://opm_user:opm_password@localhost:5432/opm_db
+          SYNC_DATABASE_URL: postgresql+psycopg://opm_user:opm_password@localhost:5432/opm_db
+          REDIS_URL: redis://localhost:6379/0
+          CELERY_BROKER_URL: redis://localhost:6379/0
+          CELERY_RESULT_BACKEND: redis://localhost:6379/0
+        run: |
+          cd backend
+          pytest tests/ -v
+
+  frontend-build:
+    name: Frontend Typecheck & Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Frontend Dependencies
+        run: |
+          cd frontend
+          npm ci
+
+      - name: Build Next.js Production Bundle
+        run: |
+          cd frontend
+          npm run build

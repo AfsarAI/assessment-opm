@@ -24,6 +24,30 @@ async def lifespan(app: FastAPI):
     # Startup actions
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
     logger.info("Starting Assessment OPM FastAPI service...")
+
+    # Reconcile any orphan in-progress jobs from a previous crash or restart
+    try:
+        from app.core.database import async_session_factory
+        from sqlalchemy import text
+        async with async_session_factory() as db:
+            result = await db.execute(
+                text(
+                    """
+                    UPDATE import_jobs
+                    SET status = 'FAILED',
+                        stage_message = 'Import terminated due to server restart',
+                        error_message = 'Process interrupted during previous server shutdown/restart',
+                        completed_at = NOW()
+                    WHERE status IN ('QUEUED', 'PARSING', 'VALIDATING', 'IMPORTING');
+                    """
+                )
+            )
+            await db.commit()
+            if result.rowcount > 0:
+                logger.info(f"Reconciled {result.rowcount} orphan import jobs from previous run.")
+    except Exception as e:
+        logger.warning(f"Could not reconcile orphan import jobs on startup: {e}")
+
     yield
     # Shutdown actions
     logger.info("Shutting down Assessment OPM FastAPI service...")
@@ -39,9 +63,13 @@ app = FastAPI(
 )
 
 # CORS Configuration
+cors_origins = settings.CORS_ORIGINS if isinstance(settings.CORS_ORIGINS, list) else [str(settings.CORS_ORIGINS)]
+allow_all = "*" in cors_origins
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS if isinstance(settings.CORS_ORIGINS, list) else ["*"],
+    allow_origins=[] if allow_all else cors_origins,
+    allow_origin_regex=r"^https?:\/\/.*" if allow_all else None,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
