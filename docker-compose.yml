@@ -77,7 +77,7 @@ services:
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
     volumes:
       - ./backend/uploads:/app/uploads
-    command: celery -A app.core.celery_app.celery_app worker --loglevel=info --concurrency=4
+    command: celery -A app.core.celery_app.celery_app worker --loglevel=info --concurrency=4 -Q imports,webhooks,celery
 
   frontend:
     build:
