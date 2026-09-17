@@ -86,9 +86,11 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 
 from app.api.v1.imports import router as imports_router
+from app.api.v1.webhooks import router as webhooks_router
 
 # Include Routers
 app.include_router(health_router)
 app.include_router(products_router, prefix="/api/v1")
 app.include_router(imports_router, prefix="/api/v1")
+app.include_router(webhooks_router, prefix="/api/v1")
 
