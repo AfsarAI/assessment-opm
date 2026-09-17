@@ -25,7 +25,7 @@ export interface ProductListResponse {
 export interface ImportJob {
   id: string;
   filename: string;
-  status: "QUEUED" | "PARSING" | "VALIDATING" | "IMPORTING" | "COMPLETED" | "COMPLETED_WITH_ERRORS" | "FAILED";
+  status: "QUEUED" | "PARSING" | "VALIDATING" | "IMPORTING" | "COMPLETED" | "COMPLETED_WITH_ERRORS" | "FAILED" | "CANCELLED";
   total_rows: number;
   processed_rows: number;
   successful_rows: number;
@@ -49,7 +49,7 @@ export interface ImportErrorItem {
 
 export interface ImportProgressEvent {
   import_id: string;
-  status: "QUEUED" | "PARSING" | "VALIDATING" | "IMPORTING" | "COMPLETED" | "COMPLETED_WITH_ERRORS" | "FAILED";
+  status: "QUEUED" | "PARSING" | "VALIDATING" | "IMPORTING" | "COMPLETED" | "COMPLETED_WITH_ERRORS" | "FAILED" | "CANCELLED";
   progress: number;
   processed_rows: number;
   total_rows: number;

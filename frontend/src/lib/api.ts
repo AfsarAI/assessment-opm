@@ -164,10 +164,14 @@ export async function deleteAllProducts(): Promise<{ success: boolean; message: 
 // ----------------------------------------------------
 export async function uploadCsv(
   file: File,
-  onProgress?: (percent: number, loadedBytes: number, totalBytes: number) => void
+  onProgress?: (percent: number, loadedBytes: number, totalBytes: number) => void,
+  onXhrCreated?: (xhr: XMLHttpRequest) => void
 ): Promise<{ import_id: string; status: string; message: string; filename?: string }> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
+    if (onXhrCreated) {
+      onXhrCreated(xhr);
+    }
     xhr.open("POST", `${API_BASE_URL}/imports`);
 
     if (onProgress && xhr.upload) {
@@ -201,6 +205,10 @@ export async function uploadCsv(
       reject(new ApiError("Network error during file upload. Check your internet connection.", "NETWORK_ERROR", 0));
     };
 
+    xhr.onabort = () => {
+      reject(new ApiError("Upload cancelled by user.", "CANCELLED", 0));
+    };
+
     xhr.ontimeout = () => {
       reject(new ApiError("Upload request timed out.", "TIMEOUT_ERROR", 408));
     };
@@ -209,6 +217,14 @@ export async function uploadCsv(
     formData.append("file", file);
     xhr.send(formData);
   });
+}
+
+export async function cancelImport(id: string): Promise<{ import_id: string; status: string; message: string }> {
+  const res = await fetch(`${API_BASE_URL}/imports/${id}/cancel`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+  });
+  return handleResponse<{ import_id: string; status: string; message: string }>(res);
 }
 
 export async function getImports(limit: number = 10): Promise<ImportJob[]> {

@@ -30,6 +30,7 @@ AsyncSessionLocal = async_sessionmaker(
     autocommit=False,
     autoflush=False,
 )
+async_session_factory = AsyncSessionLocal
 
 # Synchronous engine for Celery worker & Alembic migrations
 sync_engine = create_engine(

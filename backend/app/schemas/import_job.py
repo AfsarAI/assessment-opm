@@ -46,3 +46,10 @@ class ImportProgressPayload(BaseModel):
     failed_rows: int
     stage_message: str
     error_message: Optional[str] = None
+
+
+class ImportCancelResponse(BaseModel):
+    import_id: uuid.UUID
+    status: str
+    message: str
+

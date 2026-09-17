@@ -27,9 +27,9 @@ async def lifespan(app: FastAPI):
 
     # Reconcile any orphan in-progress jobs from a previous crash or restart
     try:
-        from app.core.database import async_session_factory
+        from app.core.database import AsyncSessionLocal
         from sqlalchemy import text
-        async with async_session_factory() as db:
+        async with AsyncSessionLocal() as db:
             result = await db.execute(
                 text(
                     """

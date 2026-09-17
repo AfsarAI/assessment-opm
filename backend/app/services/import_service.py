@@ -17,8 +17,44 @@ from app.core.database import get_sync_db, sync_engine
 logger = logging.getLogger("import_service")
 
 
+class ImportCancelledException(Exception):
+    """Raised when an active import is cancelled by the user."""
+    pass
+
+
 def get_redis_client():
     return redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
+
+
+def is_cancellation_requested(job_id_str: str, r: Optional[redis.Redis] = None) -> bool:
+    """Checks whether a cancellation flag was set in Redis or DB for this import job."""
+    try:
+        if r is None:
+            r = get_redis_client()
+        val = r.get(f"import_cancel:{job_id_str}")
+        if val in ("1", 1, True, "true"):
+            return True
+    except Exception:
+        pass
+
+    try:
+        with get_sync_db() as db:
+            row = db.execute(
+                text("SELECT status FROM import_jobs WHERE id = :id"),
+                {"id": job_id_str},
+            ).fetchone()
+            if row and row[0] in ("CANCELLED", "CANCELLING"):
+                return True
+    except Exception:
+        pass
+
+    return False
+
+
+def check_cancellation(job_id_str: str, r: Optional[redis.Redis] = None):
+    """Raises ImportCancelledException immediately if cancellation was requested."""
+    if is_cancellation_requested(job_id_str, r):
+        raise ImportCancelledException("Import was cancelled by user.")
 
 
 def update_job_db(
@@ -39,13 +75,18 @@ def update_job_db(
                     text(
                         """
                         UPDATE import_jobs
-                        SET status = :status,
+                        SET status = CAST(:status AS VARCHAR(50)),
                             progress = :progress,
                             stage_message = :stage_msg,
                             processed_rows = :processed,
                             successful_rows = :successful,
                             failed_rows = :failed,
                             error_message = :err,
+                            completed_at = CASE 
+                                WHEN CAST(:status AS VARCHAR(50)) IN ('COMPLETED', 'COMPLETED_WITH_ERRORS', 'FAILED', 'CANCELLED') 
+                                THEN NOW() 
+                                ELSE completed_at 
+                            END,
                             updated_at = NOW()
                         WHERE id = :id
                         """
@@ -124,6 +165,8 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
     gin_indexes_exist = {"name_trgm": False, "sku_trgm": False}
 
     try:
+        check_cancellation(job_id_str, r)
+
         # 1. Transition state to PARSING
         with get_sync_db() as db:
             db.execute(
@@ -143,6 +186,8 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
             r, job_id_str, "PARSING", 5, 0, 0, 0, 0, "Parsing CSV header and validating structure..."
         )
 
+        check_cancellation(job_id_str, r)
+
         # 2. Check file existence & count rows
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"File {file_path} not found on server")
@@ -152,6 +197,8 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
             next(reader, None)  # Exclude header
             total_rows = sum(1 for _ in reader)
             total_rows = max(0, total_rows)
+
+        check_cancellation(job_id_str, r)
 
         with get_sync_db() as db:
             db.execute(
@@ -171,6 +218,7 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
         )
 
         # 3. Create unlogged staging table with pre-normalized sku_lower column
+        check_cancellation(job_id_str, r)
         with sync_engine.connect() as raw_conn:
             with raw_conn.begin():
                 raw_conn.execute(
@@ -211,6 +259,13 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
             raw_db_conn = sync_engine.raw_connection()
             try:
                 raw_cursor = raw_db_conn.cursor()
+                try:
+                    raw_cursor.execute("SELECT pg_backend_pid();")
+                    p_pid = raw_cursor.fetchone()
+                    if p_pid:
+                        r.setex(f"import_pg_pid:{job_id_str}", 3600, str(p_pid[0]))
+                except Exception:
+                    pass
 
                 for row_idx, row in enumerate(reader, start=1):
                     processed_rows += 1
@@ -235,6 +290,8 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
                     batch_valid.append((row_idx, sku, name, description, sku.lower()))
 
                     if len(batch_valid) >= chunk_size:
+                        check_cancellation(job_id_str, r)
+
                         tsv_buffer = io.StringIO()
                         for r_num, r_sku, r_name, r_desc, r_low in batch_valid:
                             esc_sku = r_sku.replace("\\", "\\\\").replace("\t", " ").replace("\n", " ").replace("\r", "")
@@ -270,6 +327,7 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
 
                 # Flush remaining records
                 if batch_valid:
+                    check_cancellation(job_id_str, r)
                     tsv_buffer = io.StringIO()
                     for r_num, r_sku, r_name, r_desc, r_low in batch_valid:
                         esc_sku = r_sku.replace("\\", "\\\\").replace("\t", " ").replace("\n", " ").replace("\r", "")
@@ -289,6 +347,8 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
                 raw_cursor.close()
                 raw_db_conn.close()
 
+        check_cancellation(job_id_str, r)
+
         # Insert buffered validation errors if any
         if error_records_to_insert:
             with get_sync_db() as db:
@@ -303,6 +363,8 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
                         {"import_id": imp_id, "row_num": r_num, "error_msg": err_msg, "raw_data": raw_d[:500]},
                     )
 
+        check_cancellation(job_id_str, r)
+
         # 5. In-Database Indexing & Deterministic Deduplication
         stage_msg = "Indexing staged records for zero-memory deduplication..."
         update_job_db(job_id_str, "IMPORTING", 62, stage_msg, processed_rows, successful_rows, failed_rows)
@@ -311,7 +373,12 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
         # 5a. Create composite index on staging table for streaming DISTINCT ON (avoids quicksort memory spike)
         with sync_engine.connect() as conn:
             with conn.begin():
+                pid_row = conn.execute(text("SELECT pg_backend_pid();")).fetchone()
+                if pid_row:
+                    r.setex(f"import_pg_pid:{job_id_str}", 3600, str(pid_row[0]))
                 conn.execute(text(f"CREATE INDEX idx_{clean_id}_dedup ON {staging_table} (sku_lower, row_num DESC);"))
+
+        check_cancellation(job_id_str, r)
 
         # 5b. Create unlogged deduplication table (latest row_num wins, case-insensitive)
         stage_msg = "Deduplicating case-insensitive SKUs (latest row winning)..."
@@ -320,6 +387,9 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
 
         with sync_engine.connect() as conn:
             with conn.begin():
+                pid_row = conn.execute(text("SELECT pg_backend_pid();")).fetchone()
+                if pid_row:
+                    r.setex(f"import_pg_pid:{job_id_str}", 3600, str(pid_row[0]))
                 conn.execute(
                     text(
                         f"""
@@ -334,6 +404,8 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
                 conn.execute(text(f"ALTER TABLE {dedup_table} ADD PRIMARY KEY (row_num);"))
                 # Staging table is no longer needed; drop immediately to reclaim disk space
                 conn.execute(text(f"DROP TABLE IF EXISTS {staging_table};"))
+
+        check_cancellation(job_id_str, r)
 
         # 5c. Get range and count from deduplication table
         with sync_engine.connect() as conn:
@@ -369,26 +441,36 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
                     conn.execute(text("DROP INDEX IF EXISTS ix_products_sku_trgm;"))
                     logger.info("Dropped ix_products_sku_trgm for bulk import")
 
-        # 7. Range-Chunked Catalogue UPSERT
-        # Executing in bounded 50,000-row chunks prevents:
+        check_cancellation(job_id_str, r)
+
+        # 7. Range-Chunked Catalogue UPSERT within a Single Atomic Transaction
+        # Executing in bounded 25,000-row chunks inside ONE transaction prevents:
         # - Linux kernel OOM kills on Render Free Tier (each chunk requires <5 MB RAM)
-        # - Reverse proxy TCP idle drops (each chunk completes in ~1.5s, sending fresh query results)
-        # - Long lock contention
-        # active=false is preserved: ON CONFLICT does NOT overwrite the active column.
-        upsert_chunk_size = 50000
+        # - Reverse proxy TCP idle drops (each chunk completes in ~3-7s)
+        # - Partial data corruption: If cancelled or failed at any chunk, ROLLBACK ensures 0 partial rows in products!
+        # - Pre-existing active=false status is preserved: ON CONFLICT does NOT overwrite the active column.
+        # - Honest progress: successful_rows is ONLY reported after transaction commit!
+        upsert_chunk_size = 25000
         current_id = min_row_num
         total_upserted = 0
         chunk_num = 0
-        total_chunks = ((max_row_num - min_row_num) // upsert_chunk_size) + 1 if unique_product_count > 0 else 1
 
         upsert_error = None
         try:
-            while current_id <= max_row_num and unique_product_count > 0:
-                chunk_num += 1
-                next_id = current_id + upsert_chunk_size
+            with sync_engine.connect() as conn:
+                with conn.begin():
+                    pid_row = conn.execute(text("SELECT pg_backend_pid();")).fetchone()
+                    if pid_row:
+                        r.setex(f"import_pg_pid:{job_id_str}", 3600, str(pid_row[0]))
+                    conn.execute(text("SET LOCAL work_mem = '64MB';"))
+                    conn.execute(text("SET LOCAL synchronous_commit = off;"))
 
-                with sync_engine.connect() as conn:
-                    with conn.begin():
+                    while current_id <= max_row_num and unique_product_count > 0:
+                        check_cancellation(job_id_str, r)
+
+                        chunk_num += 1
+                        next_id = current_id + upsert_chunk_size
+
                         res = conn.execute(
                             text(
                                 f"""
@@ -406,41 +488,51 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
                         )
                         chunk_upserted = res.rowcount
                         total_upserted += chunk_upserted
+                        current_id = next_id
 
-                current_id = next_id
+                        # Progress scaled between 70% and 90%
+                        pct = int(70 + (total_upserted / unique_product_count) * 20) if unique_product_count > 0 else 85
+                        pct = min(90, max(70, pct))
+                        stage_msg = f"Merging into catalogue: {total_upserted:,} / {unique_product_count:,} products ({pct}%)..."
+                        # CRITICAL: We report successful_rows as 0 during merge because transaction has not committed yet!
+                        publish_progress(
+                            r,
+                            job_id_str,
+                            "IMPORTING",
+                            pct,
+                            processed_rows,
+                            total_rows,
+                            0,
+                            failed_rows,
+                            stage_msg,
+                        )
 
-                # Progress scaled between 70% and 90%
-                pct = int(70 + (total_upserted / unique_product_count) * 20) if unique_product_count > 0 else 85
-                pct = min(90, max(70, pct))
-                stage_msg = f"Merging into catalogue: {total_upserted:,} / {unique_product_count:,} products ({pct}%)..."
-                publish_progress(
-                    r,
-                    job_id_str,
-                    "IMPORTING",
-                    pct,
-                    processed_rows,
-                    total_rows,
-                    total_upserted,
-                    failed_rows,
-                    stage_msg,
-                )
+                    # Check cancellation right before commit
+                    check_cancellation(job_id_str, r)
 
-            # Drop dedup table upon successful merge
-            with sync_engine.connect() as conn:
-                with conn.begin():
+                    # Drop dedup table upon successful merge before commit
                     conn.execute(text(f"DROP TABLE IF EXISTS {dedup_table};"))
+                    # Transaction commits atomically here!
 
         except Exception as e:
             upsert_error = e
 
+        # If upsert failed or was cancelled, handle before index rebuild
+        if upsert_error is not None:
+            raise upsert_error
+
         # 8. Rebuild GIN trgm search indexes in a single sequential scan
         try:
             stage_msg = "Rebuilding search indexes..."
-            update_job_db(job_id_str, "IMPORTING", 92, stage_msg, processed_rows, total_upserted, failed_rows)
-            publish_progress(r, job_id_str, "IMPORTING", 92, processed_rows, total_rows, total_upserted, failed_rows, stage_msg)
+            update_job_db(job_id_str, "IMPORTING", 92, stage_msg, processed_rows, 0, failed_rows)
+            publish_progress(r, job_id_str, "IMPORTING", 92, processed_rows, total_rows, 0, failed_rows, stage_msg)
 
             with sync_engine.connect() as conn:
                 with conn.begin():
+                    pid_row = conn.execute(text("SELECT pg_backend_pid();")).fetchone()
+                    if pid_row:
+                        r.setex(f"import_pg_pid:{job_id_str}", 3600, str(pid_row[0]))
+                    conn.execute(text("SET LOCAL maintenance_work_mem = '64MB';"))
                     if gin_indexes_exist["name_trgm"]:
                         conn.execute(text("""
                             CREATE INDEX IF NOT EXISTS ix_products_name_trgm ON products
@@ -455,10 +547,6 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
                         logger.info("Rebuilt ix_products_sku_trgm")
         except Exception as rebuild_err:
             logger.error(f"Failed to rebuild GIN indexes: {rebuild_err}")
-
-        # If upsert failed, re-raise error
-        if upsert_error is not None:
-            raise upsert_error
 
         # 9. Finalize Job: only committed rows are reported as succeeded
         successful_rows = total_upserted
@@ -487,6 +575,13 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
 
         logger.info(f"Import {job_id_str} completed successfully: {successful_rows:,} succeeded, {failed_rows:,} failed.")
 
+        # Clean up Redis cancellation keys
+        try:
+            r.delete(f"import_cancel:{job_id_str}")
+            r.delete(f"import_pg_pid:{job_id_str}")
+        except Exception:
+            pass
+
         # Dispatch import.completed webhook
         try:
             from app.tasks.webhook_tasks import dispatch_webhook_event
@@ -503,7 +598,123 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
         except Exception:
             pass
 
+    except ImportCancelledException:
+        logger.info(f"Import pipeline cancelled by user for job {job_id_str}")
+        # Clean up temporary tables
+        try:
+            with sync_engine.connect() as conn:
+                with conn.begin():
+                    conn.execute(text(f"DROP TABLE IF EXISTS {staging_table};"))
+                    conn.execute(text(f"DROP TABLE IF EXISTS {dedup_table};"))
+        except Exception:
+            pass
+
+        # Restore GIN indexes if they were dropped before cancellation
+        try:
+            with sync_engine.connect() as conn:
+                with conn.begin():
+                    if gin_indexes_exist.get("name_trgm"):
+                        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_products_name_trgm ON products USING gin (name gin_trgm_ops);"))
+                    if gin_indexes_exist.get("sku_trgm"):
+                        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_products_sku_trgm ON products USING gin (sku gin_trgm_ops);"))
+        except Exception:
+            pass
+
+        # Update import_jobs as CANCELLED in PostgreSQL with 0 succeeded rows
+        update_job_db(
+            job_id_str,
+            "CANCELLED",
+            0,
+            "Import cancelled by user",
+            processed_rows,
+            0,
+            failed_rows,
+        )
+        publish_progress(
+            r,
+            job_id_str,
+            "CANCELLED",
+            0,
+            processed_rows,
+            total_rows,
+            0,
+            failed_rows,
+            "Import cancelled by user",
+        )
+
+        try:
+            r.delete(f"import_cancel:{job_id_str}")
+            r.delete(f"import_pg_pid:{job_id_str}")
+        except Exception:
+            pass
+
+        try:
+            from app.tasks.webhook_tasks import dispatch_webhook_event
+            dispatch_webhook_event.delay(
+                "import.cancelled",
+                {"import_id": job_id_str},
+            )
+        except Exception:
+            pass
+        return {"status": "CANCELLED"}
+
     except Exception as e:
+        err_msg_lower = str(e).lower()
+        is_cancel = (
+            "canceling statement due to user request" in err_msg_lower
+            or "querycanceled" in type(e).__name__.lower()
+            or is_cancellation_requested(job_id_str, r)
+        )
+
+        if is_cancel:
+            logger.info(f"Import pipeline SQL query cancelled by user for job {job_id_str}")
+            # Clean up temporary tables
+            try:
+                with sync_engine.connect() as conn:
+                    with conn.begin():
+                        conn.execute(text(f"DROP TABLE IF EXISTS {staging_table};"))
+                        conn.execute(text(f"DROP TABLE IF EXISTS {dedup_table};"))
+            except Exception:
+                pass
+
+            # Restore GIN indexes if they were dropped
+            try:
+                with sync_engine.connect() as conn:
+                    with conn.begin():
+                        if gin_indexes_exist.get("name_trgm"):
+                            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_products_name_trgm ON products USING gin (name gin_trgm_ops);"))
+                        if gin_indexes_exist.get("sku_trgm"):
+                            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_products_sku_trgm ON products USING gin (sku gin_trgm_ops);"))
+            except Exception:
+                pass
+
+            update_job_db(
+                job_id_str,
+                "CANCELLED",
+                0,
+                "Import cancelled by user",
+                processed_rows,
+                0,
+                failed_rows,
+            )
+            publish_progress(
+                r,
+                job_id_str,
+                "CANCELLED",
+                0,
+                processed_rows,
+                total_rows,
+                0,
+                failed_rows,
+                "Import cancelled by user",
+            )
+            try:
+                r.delete(f"import_cancel:{job_id_str}")
+                r.delete(f"import_pg_pid:{job_id_str}")
+            except Exception:
+                pass
+            return {"status": "CANCELLED"}
+
         logger.exception(f"Import pipeline failed for job {job_id_str}: {e}")
         # Clean up temporary tables
         try:
@@ -533,7 +744,7 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
             0,
             "Import failed",
             processed_rows,
-            successful_rows,
+            0,
             failed_rows,
             error_message=str(e),
         )
@@ -544,7 +755,7 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
             0,
             processed_rows,
             total_rows,
-            successful_rows,
+            0,
             failed_rows,
             f"Import failed: {str(e)}",
             error_message=str(e),

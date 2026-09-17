@@ -4,7 +4,7 @@ import sys
 import os
 import requests
 
-BACKEND_URL = "https://opm-backend-rf77.onrender.com"
+BACKEND_URL = sys.argv[2] if len(sys.argv) > 2 else os.getenv("BACKEND_URL", "https://opm-backend-rf77.onrender.com")
 CSV_FILE = sys.argv[1] if len(sys.argv) > 1 else "products.csv"
 
 def run_live_measurement():

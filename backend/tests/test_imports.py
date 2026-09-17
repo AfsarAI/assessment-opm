@@ -43,8 +43,10 @@ async def test_upload_csv_creates_queued_job(client: AsyncClient, db_session: As
 
 @pytest.mark.asyncio
 async def test_execute_import_pipeline_end_to_end(client: AsyncClient, db_session: AsyncSession, tmp_path):
-    await db_session.execute(text("TRUNCATE TABLE products RESTART IDENTITY;"))
-    await db_session.commit()
+    from app.core.database import sync_engine
+    with sync_engine.connect() as conn:
+        with conn.begin():
+            conn.execute(text("TRUNCATE TABLE products RESTART IDENTITY;"))
 
     # 1. Create temporary CSV with duplicates and case variants
     csv_file = tmp_path / "test_import.csv"
@@ -244,4 +246,128 @@ async def test_failed_import_does_not_report_staged_as_succeeded(client: AsyncCl
     # CRITICAL: successful_rows must be 0, NOT 2!
     assert failed_job.successful_rows == 0
     assert failed_job.error_message is not None
+
+
+@pytest.mark.asyncio
+async def test_cancel_import_endpoint_success(client: AsyncClient, db_session: AsyncSession):
+    job_id = uuid.uuid4()
+    job = ImportJob(id=job_id, filename="cancel_test.csv", status="QUEUED")
+    db_session.add(job)
+    await db_session.commit()
+
+    response = await client.post(f"/api/v1/imports/{job_id}/cancel")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "CANCELLED"
+    assert data["import_id"] == str(job_id)
+
+    db_session.expire_all()
+    res = await db_session.execute(select(ImportJob).where(ImportJob.id == job_id))
+    cancelled_job = res.scalar_one()
+    assert cancelled_job.status == "CANCELLED"
+    assert cancelled_job.stage_message == "Import cancelled by user"
+    assert cancelled_job.successful_rows == 0
+
+
+@pytest.mark.asyncio
+async def test_cancel_import_endpoint_idempotent(client: AsyncClient, db_session: AsyncSession):
+    job_id = uuid.uuid4()
+    job = ImportJob(id=job_id, filename="idempotent_cancel.csv", status="CANCELLED")
+    db_session.add(job)
+    await db_session.commit()
+
+    # Second cancel call should return 200
+    response = await client.post(f"/api/v1/imports/{job_id}/cancel")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "CANCELLED"
+    assert "already cancelled" in data["message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_cancel_import_endpoint_cannot_cancel_completed(client: AsyncClient, db_session: AsyncSession):
+    job_id = uuid.uuid4()
+    job = ImportJob(id=job_id, filename="done.csv", status="COMPLETED")
+    db_session.add(job)
+    await db_session.commit()
+
+    response = await client.post(f"/api/v1/imports/{job_id}/cancel")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "COMPLETED"
+    assert "already reached terminal status" in data["message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_execution_leaves_no_partial_data(client: AsyncClient, db_session: AsyncSession, tmp_path):
+    from app.core.database import sync_engine
+    with sync_engine.connect() as conn:
+        with conn.begin():
+            conn.execute(text("TRUNCATE TABLE products RESTART IDENTITY;"))
+
+    csv_file = tmp_path / "cancel_run.csv"
+    csv_file.write_text(
+        "name,sku,description\n"
+        "Cancel Item 1,CANCEL-01,Desc 1\n"
+        "Cancel Item 2,CANCEL-02,Desc 2\n",
+        encoding="utf-8"
+    )
+
+    job_id = uuid.uuid4()
+    job = ImportJob(id=job_id, filename="cancel_run.csv", status="QUEUED")
+    db_session.add(job)
+    await db_session.commit()
+
+    # Set cancellation flag in Redis directly
+    from app.services.import_service import get_redis_client
+    r = get_redis_client()
+    r.setex(f"import_cancel:{job_id}", 60, "1")
+
+    # Run pipeline
+    result = execute_import_pipeline(str(job_id), str(csv_file))
+    assert result == {"status": "CANCELLED"}
+
+    # Verify job status in DB
+    db_session.expire_all()
+    res = await db_session.execute(select(ImportJob).where(ImportJob.id == job_id))
+    cancelled_job = res.scalar_one()
+    assert cancelled_job.status == "CANCELLED"
+    assert cancelled_job.successful_rows == 0
+
+    # Verify ZERO products were inserted
+    prod_res = await db_session.execute(select(Product))
+    products = list(prod_res.scalars().all())
+    assert len(products) == 0
+
+    # Verify staging and dedup tables do not exist
+    clean_id = str(job_id).replace("-", "")
+    with sync_engine.connect() as conn:
+        stg_exists = conn.execute(text(f"SELECT to_regclass('staging_{clean_id}');")).scalar()
+        ddp_exists = conn.execute(text(f"SELECT to_regclass('dedup_{clean_id}');")).scalar()
+        assert stg_exists is None
+        assert ddp_exists is None
+
+
+@pytest.mark.asyncio
+async def test_reimport_after_cancel_succeeds(client: AsyncClient, db_session: AsyncSession, tmp_path):
+    csv_file = tmp_path / "valid_reimport.csv"
+    csv_file.write_text(
+        "name,sku,description\n"
+        "Valid Product After Cancel,VAC-01,Description for valid product\n",
+        encoding="utf-8"
+    )
+
+    job_id = uuid.uuid4()
+    job = ImportJob(id=job_id, filename="valid_reimport.csv", status="QUEUED")
+    db_session.add(job)
+    await db_session.commit()
+
+    execute_import_pipeline(str(job_id), str(csv_file))
+
+    db_session.expire_all()
+    res = await db_session.execute(select(ImportJob).where(ImportJob.id == job_id))
+    completed_job = res.scalar_one()
+    assert completed_job.status == "COMPLETED"
+    assert completed_job.successful_rows == 1
+
 

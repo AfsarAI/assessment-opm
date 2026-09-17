@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timezone, timedelta
 import json
 import logging
 import os
@@ -7,13 +8,14 @@ from typing import List
 from fastapi import APIRouter, Depends, File, UploadFile, status, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.orm import selectinload
 import redis.asyncio as aioredis
 
 from app.core.database import get_async_db
 from app.core.config import settings
 from app.models.import_job import ImportJob, ImportErrorRecord
-from app.schemas.import_job import ImportJobResponse, ImportJobDetailResponse
+from app.schemas.import_job import ImportJobResponse, ImportJobDetailResponse, ImportCancelResponse
 from app.core.exceptions import ImportNotFoundException, InvalidCsvException
 from app.tasks.import_tasks import process_csv_import
 
@@ -38,7 +40,7 @@ async def upload_csv_and_start_import(
     os.makedirs(upload_dir, exist_ok=True)
     temp_path = os.path.join(upload_dir, f"{job_id}.csv")
 
-    # Stream file to disk in bounded 1MB chunks - never load entire file in memory
+    # Stream file to disk in bounded chunks - never load entire file in memory
     total_bytes = 0
     max_bytes = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
 
@@ -83,13 +85,32 @@ async def list_import_jobs(
     limit: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_async_db),
 ):
-    """List recent import jobs ordered by creation date."""
+    """List recent import jobs ordered by creation date, auto-reconciling stale zombie jobs."""
+    # Auto-reconcile any zombie in-progress job that hasn't updated in >15 minutes
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
+        await db.execute(
+            text(
+                """
+                UPDATE import_jobs
+                SET status = 'FAILED',
+                    stage_message = 'Import timed out or was interrupted',
+                    error_message = 'Process interrupted or timed out on server',
+                    completed_at = NOW()
+                WHERE status IN ('QUEUED', 'PARSING', 'VALIDATING', 'IMPORTING')
+                  AND updated_at < :cutoff
+                """
+            ),
+            {"cutoff": cutoff},
+        )
+        await db.commit()
+    except Exception as e:
+        logger.debug(f"Auto-reconcile check: {e}")
+
     stmt = select(ImportJob).order_by(ImportJob.created_at.desc()).limit(limit)
     result = await db.execute(stmt)
     return list(result.scalars().all())
 
-
-from sqlalchemy.orm import selectinload
 
 @router.get("/{import_id}", response_model=ImportJobDetailResponse)
 async def get_import_job(
@@ -110,6 +131,110 @@ async def get_import_job(
     return job
 
 
+@router.post("/{import_id}/cancel", response_model=ImportCancelResponse)
+async def cancel_import_job(
+    import_id: uuid.UUID,
+    db: AsyncSession = Depends(get_async_db),
+):
+    """
+    Safely and idempotently cancel an in-progress or queued import job.
+    Halts Celery worker, interrupts long-running PostgreSQL queries via pg_cancel_backend,
+    rolls back database transactions, cleans up staging tables, and emits SSE CANCELLED event.
+    """
+    import_id_str = str(import_id)
+    r = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+    try:
+        stmt = select(ImportJob).where(ImportJob.id == import_id)
+        result = await db.execute(stmt)
+        job = result.scalar_one_or_none()
+        if not job:
+            raise ImportNotFoundException(import_id_str)
+
+        if job.status in ("COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED"):
+            return ImportCancelResponse(
+                import_id=import_id,
+                status=job.status,
+                message=f"Cannot cancel import because it has already reached terminal status '{job.status}'.",
+            )
+
+        if job.status == "CANCELLED":
+            return ImportCancelResponse(
+                import_id=import_id,
+                status="CANCELLED",
+                message="Import is already cancelled.",
+            )
+
+        # 1. Set cancellation flag in Redis for worker check
+        await r.setex(f"import_cancel:{import_id_str}", 3600, "1")
+
+        # 2. Cancel active PostgreSQL backend query if PID is recorded
+        pg_pid = await r.get(f"import_pg_pid:{import_id_str}")
+        if pg_pid:
+            try:
+                await db.execute(text(f"SELECT pg_cancel_backend({int(pg_pid)});"))
+                logger.info(f"Requested pg_cancel_backend({pg_pid}) for cancelled import {import_id_str}")
+            except Exception as e:
+                logger.warning(f"pg_cancel_backend notice for import {import_id_str} (PID {pg_pid}): {e}")
+
+        # 3. Revoke Celery task if possible
+        try:
+            from app.core.celery_app import celery_app
+            celery_app.control.revoke(import_id_str, terminate=False)
+        except Exception:
+            pass
+
+        # 4. Update database record to CANCELLED
+        job.status = "CANCELLED"
+        job.stage_message = "Import cancelled by user"
+        job.completed_at = datetime.now(timezone.utc)
+        # Ensure partial data is never reported as succeeded
+        job.successful_rows = 0
+        await db.commit()
+
+        # 5. Clean up staging tables if left behind
+        clean_id = import_id_str.replace("-", "")
+        try:
+            await db.execute(text(f"DROP TABLE IF EXISTS staging_{clean_id};"))
+            await db.execute(text(f"DROP TABLE IF EXISTS dedup_{clean_id};"))
+            await db.commit()
+        except Exception:
+            pass
+
+        # 6. Clean up uploaded file if present
+        upload_path = os.path.join(settings.UPLOAD_DIR, f"{import_id_str}.csv")
+        if os.path.exists(upload_path):
+            try:
+                os.remove(upload_path)
+            except Exception:
+                pass
+
+        # 7. Publish CANCELLED to Redis Pub/Sub
+        cancel_payload = {
+            "import_id": import_id_str,
+            "status": "CANCELLED",
+            "progress": 0,
+            "processed_rows": job.processed_rows,
+            "total_rows": job.total_rows,
+            "successful_rows": 0,
+            "failed_rows": job.failed_rows,
+            "stage_message": "Import cancelled by user",
+            "error_message": None,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        await r.publish(f"import_progress:{import_id_str}", json.dumps(cancel_payload))
+        await r.setex(f"import_latest:{import_id_str}", 3600, json.dumps(cancel_payload))
+
+        logger.info(f"Import job {import_id_str} successfully cancelled by user")
+
+        return ImportCancelResponse(
+            import_id=import_id,
+            status="CANCELLED",
+            message="Import successfully cancelled.",
+        )
+    finally:
+        await r.aclose()
+
+
 @router.get("/{import_id}/progress")
 async def stream_import_progress(
     import_id: uuid.UUID,
@@ -117,7 +242,7 @@ async def stream_import_progress(
 ):
     """
     Real-time Server-Sent Events (SSE) endpoint for tracking CSV import progress.
-    Streams live state transitions and auto-disconnects on completion.
+    Streams live state transitions and auto-disconnects on completion or cancellation.
     """
     import_id_str = str(import_id)
 
@@ -155,8 +280,8 @@ async def stream_import_progress(
         # Yield current initial state immediately
         yield f"event: progress\ndata: {json.dumps(initial_payload)}\n\n"
 
-        # If already completed or failed, terminate stream immediately
-        if initial_payload["status"] in ("COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED"):
+        # If already terminal, terminate stream immediately
+        if initial_payload["status"] in ("COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED", "CANCELLED"):
             await r.aclose()
             return
 
@@ -179,7 +304,7 @@ async def stream_import_progress(
                         stmt = select(ImportJob).where(ImportJob.id == import_id)
                         res = await db.execute(stmt)
                         current_db_job = res.scalar_one_or_none()
-                        if current_db_job and current_db_job.status in ("COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED"):
+                        if current_db_job and current_db_job.status in ("COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED", "CANCELLED"):
                             term_payload = {
                                 "import_id": import_id_str,
                                 "status": current_db_job.status,
@@ -207,7 +332,7 @@ async def stream_import_progress(
                     # Check for terminal state to cleanly close SSE connection
                     try:
                         parsed = json.loads(raw_data)
-                        if parsed.get("status") in ("COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED"):
+                        if parsed.get("status") in ("COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED", "CANCELLED"):
                             break
                     except Exception:
                         pass
