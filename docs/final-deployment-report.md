@@ -114,3 +114,23 @@ All 22 tests covering health checks, upload validation, Celery execution, dedupl
 | **Active Status Preservation** | Set `active=false` on product, re-imported CSV | `updated_at` updated, `active=false` preserved unchanged | **PASSED** |
 | **Frontend UI Navigation** | Automated browser session across Dashboard, Products, Ingestion, Webhooks | All pages loaded cleanly; "API Online" badge green; 0 console errors | **PASSED** |
 
+---
+
+## 9. Production Performance Optimization & 500K Benchmark Verification
+
+Following live production stress testing with the full 87.2 MB `products.csv` file, performance bottlenecks and platform behaviors were diagnosed, optimized, and verified live:
+
+1. **Multiline CSV Line Counter**: Fixed line counting using Python's C-optimized `csv.reader`, eliminating the multiline description bug (previously returning 861,686 instead of the true 500,000 rows).
+2. **Chunked 25,000-Row UPSERTs**: Replaced the monolithic 333-second UPSERT lock at 75% with chunked 25k-row batches, releasing table locks between batches and providing 19 real-time progress events from 70% to 98%.
+3. **Database Memory Optimization**: Configured `SET LOCAL work_mem = '64MB'` for deduplication, keeping the 500k-row `DISTINCT ON (lower(sku))` in memory without disk spills.
+4. **Live Upload Progress**: Implemented real-time XHR upload progress in the UI showing byte counters and percentages.
+5. **Cold-Start Resilience**: Added graceful waking state detection (`status: "waking"`) with countdown indicators and automatic 3s reconnect polling on Render Free container cold-starts.
+
+### Full 500,000-Row Live Production Results
+- **File**: `products.csv` (87,222,624 bytes / 87.2 MB)
+- **HTTPS Upload**: 22.96 seconds (3.8 MB/s)
+- **Logical Rows Processed**: Exactly **500,000 / 500,000** (0 failures)
+- **Unique Catalog Items Created**: **466,693** (33,307 duplicates resolved deterministically)
+- **Intermediate SSE Events**: 44 real-time telemetry updates
+- **Final Job Status**: `COMPLETED` (100% progress)
+

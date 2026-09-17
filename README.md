@@ -34,7 +34,10 @@ A production-grade, asynchronous web application capable of streaming, validatin
 | **API Response Time** | **< 15 ms** | Immediate HTTP 202 Accepted | **Non-blocking** |
 | **Worker Peak RAM (RSS)** | **< 220 MB** | Streaming chunking | **Low Footprint** |
 
-Detailed benchmark methodology and timings can be found in [Benchmark Results](docs/benchmark-results.md).
+Detailed benchmark methodology, live production telemetry, and optimization analyses can be found in:
+- [Production Performance Audit & Optimization](docs/production-performance-audit.md) *(Live 500k Render & Vercel measurements)*
+- [Benchmark Results](docs/benchmark-results.md) *(Local & containerized benchmarks)*
+- [Final Deployment Report](docs/final-deployment-report.md) *(End-to-end verification)*
 
 ---
 
