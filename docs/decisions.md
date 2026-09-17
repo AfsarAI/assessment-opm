@@ -1,0 +1,82 @@
+# Architecture Decision Records (ADR): Assessment OPM
+
+This document records the critical architectural, data, and engineering decisions made for the Assessment OPM implementation.
+
+---
+
+## ADR 001: Backend Framework Selection (FastAPI)
+- **Decision**: Use FastAPI with Python 3.12, Pydantic v2, and SQLAlchemy 2.0.
+- **Context**: The assessment permitted Flask, Django, or FastAPI.
+- **Rationale**:
+  - Native asynchronous ASGI architecture allows long-lived connections for Server-Sent Events (SSE) without exhausting worker threads.
+  - Pydantic v2 offers high-speed validation compiled in Rust.
+  - Automatic OpenAPI / Swagger generation at `/docs`.
+  - Clean separation of routes, schemas, services, and models.
+
+---
+
+## ADR 002: Asynchronous Task Queue & Broker (Celery + Redis)
+- **Decision**: Celery backed by Redis 7.
+- **Context**: Importing 500,000 records takes dozens of seconds and must never run in the synchronous request-response lifecycle of an HTTP request.
+- **Rationale**:
+  - Celery is the industry standard for distributed task execution in Python.
+  - Redis serves dual duty: high-throughput Celery message broker and lightweight Pub/Sub bus for real-time progress events.
+  - Enables independent horizontal scaling of worker processes separate from API web servers.
+
+---
+
+## ADR 003: 500,000-Row Bulk Ingestion via PostgreSQL UNLOGGED Staging & COPY
+- **Decision**: Stream CSV rows via chunks, write to an ephemeral `UNLOGGED` staging table via PostgreSQL `COPY`, deduplicate via SQL `DISTINCT ON`, and execute an atomic `UPSERT` into `products`.
+- **Alternatives Considered**:
+  - *SQLAlchemy ORM iteration*: Extreme memory usage (>1.5 GB), tens of minutes runtime. Rejected.
+  - *SQLAlchemy Core `insert().values([...])`*: Better, but still requires multi-megabyte parameter bindings and high network payload overhead.
+- **Rationale**:
+  - PostgreSQL's `COPY` command is the fastest ingestion mechanism available in SQL engines.
+  - `UNLOGGED` tables bypass WAL (Write-Ahead Logging) write overhead for transient staging data.
+  - Set-based SQL deduplication (`DISTINCT ON (LOWER(sku)) ... ORDER BY LOWER(sku), row_number DESC`) guarantees determinism: the latest CSV row overwrites earlier rows with zero Python-side memory overhead.
+
+---
+
+## ADR 004: Case-Insensitive SKU Uniqueness Enforced at Database Level
+- **Decision**: Create a functional unique index:
+  ```sql
+  CREATE UNIQUE INDEX uq_products_sku_lower ON products (LOWER(sku));
+  ```
+- **Context**: Product SKUs can arrive in inconsistent casing (`ABC-123`, `abc-123`, `Abc-123`).
+- **Rationale**:
+  - Application-level uniqueness checks are vulnerable to race conditions under concurrent requests or multi-worker pipelines.
+  - The database must be the authoritative source of truth.
+  - Functional B-Tree index on `LOWER(sku)` guarantees consistency and enables indexed lookups for lowercase queries.
+
+---
+
+## ADR 005: Preserving Product Status (`active`) Across CSV Re-Imports
+- **Decision**: The CSV does not contain an `active` column. The database defaults `active` to `TRUE` on creation. On re-import, the UPSERT query explicitly updates only `name`, `description`, and `updated_at`, leaving `active` untouched.
+- **Rationale**:
+  - E-commerce administrators who manually deactivate a product must not have their operational state overwritten every time a supplier or ERP CSV is synchronized.
+
+---
+
+## ADR 006: Server-Sent Events (SSE) vs WebSockets for Progress
+- **Decision**: Use Server-Sent Events (SSE) over HTTP streaming.
+- **Rationale**:
+  - Import progress is strictly a unidirectional server-to-client telemetry stream.
+  - SSE operates over standard HTTP/1.1 or HTTP/2, traverses enterprise proxies, firewalls, and CDNs without specialized WebSocket negotiation.
+  - Simple reconnection mechanism with built-in event IDs and retry headers.
+  - Client-side implementation is native via `EventSource` in standard browser APIs.
+
+---
+
+## ADR 007: Safe Bulk Deletion Strategy (`DELETE /api/v1/products`)
+- **Decision**: Implement instant `TRUNCATE TABLE products;` guarded by a required query confirmation (`confirm=true`) and confirmation header, while enqueuing the `products.cleared` webhook.
+- **Rationale**:
+  - Executing `DELETE FROM products` on 500,000 rows generates immense WAL logs, causes high table lock contention, and takes 10-30 seconds.
+  - `TRUNCATE` deallocates table pages instantly in sub-100ms.
+
+---
+
+## ADR 008: Webhook Delivery & SSRF Guard
+- **Decision**: Webhooks are delivered via Celery background tasks with strict SSRF (Server-Side Request Forgery) IP resolution filtering.
+- **Rationale**:
+  - Synchronous webhooks in CRUD routes would block API latency and make the server vulnerable to slow-consumer DDoS.
+  - Webhooks accepting arbitrary URLs can be exploited to probe internal microservices (`localhost`, `169.254.169.254` AWS/GCP instance metadata). Pre-resolving and blocking private subnets mitigates SSRF vulnerabilities.

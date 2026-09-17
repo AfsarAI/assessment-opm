@@ -1,0 +1,9 @@
+name,sku,description
+Widget Standard,SKU-001,Initial product
+Widget Duplicate Exact,SKU-001,Exact duplicate SKU - should replace previous
+Gadget Upper,GADGET-999,Upper case SKU
+Gadget Lower,gadget-999,Lower case SKU - should replace GADGET-999
+Gadget Mixed,GaDgEt-999,Mixed case SKU - final replacement winner
+Product With Quotes,"QUOTED-""SPECIAL""-01","Description with ""quotes"" and commas, in text."
+Product With Unicode,UNICODE-ÜBER-01,"Café, naïve, façade, résumé characters"
+Product Max Length Name XXXXXXXXXX,SKU-MAX-LEN-1234567,Normal description
