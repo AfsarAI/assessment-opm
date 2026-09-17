@@ -1,0 +1,9 @@
+node_modules
+.next
+.git
+.turbo
+build
+dist
+npm-debug.log*
+yarn-debug.log*
+.DS_Store
