@@ -23,11 +23,16 @@ async def list_products(
     name: Optional[str] = Query(None, description="Filter by product name (case-insensitive substring)"),
     description: Optional[str] = Query(None, description="Filter by description"),
     status: Optional[str] = Query(None, description="Filter by status: 'active', 'inactive', or 'all'"),
+    active: Optional[bool] = Query(None, description="Filter by active flag: true or false"),
     sort_by: str = Query("created_at", description="Sort field: 'created_at', 'sku', 'name'"),
     sort_order: str = Query("desc", description="Sort direction: 'asc' or 'desc'"),
     db: AsyncSession = Depends(get_async_db),
 ):
     """Retrieve a paginated list of products with multi-attribute filtering."""
+    resolved_status = status
+    if resolved_status is None and active is not None:
+        resolved_status = "active" if active else "inactive"
+
     items, pagination = await ProductService.list_products(
         db=db,
         page=page,
@@ -35,7 +40,7 @@ async def list_products(
         sku=sku,
         name=name,
         description=description,
-        status=status,
+        status=resolved_status,
         sort_by=sort_by,
         sort_order=sort_order,
     )

@@ -20,14 +20,18 @@ async def test_upload_invalid_file_extension(client: AsyncClient):
 
 @pytest.mark.asyncio
 async def test_upload_csv_creates_queued_job(client: AsyncClient, db_session: AsyncSession):
+    from unittest.mock import patch
+
     csv_content = "name,sku,description\nTest Product,TEST-SKU-1,A test description\n"
     files = {"file": ("products.csv", csv_content.encode("utf-8"), "text/csv")}
 
-    response = await client.post("/api/v1/imports", files=files)
-    assert response.status_code == 202
-    data = response.json()
-    assert data["status"] == "QUEUED"
-    assert "import_id" in data
+    with patch("app.api.v1.imports.process_csv_import.delay") as mock_delay:
+        response = await client.post("/api/v1/imports", files=files)
+        assert response.status_code == 202
+        data = response.json()
+        assert data["status"] == "QUEUED"
+        assert "import_id" in data
+        mock_delay.assert_called_once()
 
     # Verify record in database
     job_uuid = uuid.UUID(data["import_id"])

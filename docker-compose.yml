@@ -51,6 +51,7 @@ services:
     ports:
       - "8000:8000"
     volumes:
+      - ./backend/app:/app/app
       - ./backend/uploads:/app/uploads
     command: >
       sh -c "alembic upgrade head &&
@@ -76,6 +77,7 @@ services:
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
     volumes:
+      - ./backend/app:/app/app
       - ./backend/uploads:/app/uploads
     command: celery -A app.core.celery_app.celery_app worker --loglevel=info --concurrency=4 -Q imports,webhooks,celery
 

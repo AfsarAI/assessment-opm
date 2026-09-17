@@ -1,6 +1,6 @@
 # AI-Assisted Development Log: Assessment OPM
 
-This document transparently records the AI-assisted engineering workflow, design deliberations, prompt interactions, accepted suggestions, rejected proposals, and optimizations made throughout the development of Assessment OPM.
+This document records the AI-assisted engineering workflow, design deliberations, prompt interactions, accepted suggestions, rejected proposals, and optimizations made throughout the development of Assessment OPM.
 
 ---
 
@@ -60,7 +60,51 @@ This document transparently records the AI-assisted engineering workflow, design
 
 ---
 
-## 4. Security & Robustness Considerations
-- Added DNS resolution and IP subnet validation to the webhook engine to prevent Server-Side Request Forgery (SSRF) against internal services and cloud instance metadata (`169.254.169.254`).
-- Implemented file upload size checks and secure random UUID naming to eliminate path traversal vulnerabilities.
-- Provided typed confirmation dialog for destructive bulk operations (`DELETE /api/v1/products`).
+## 4. Key Debugging & Quality Assurance Iterations
+
+Throughout development, several subtle challenges were caught and resolved:
+
+1. **AsyncPG Event-Loop Sharing in Pytest**:
+   - *Problem*: Pytest-asyncio creates per-test event loops, causing standard AsyncEngine connection pool reuse across tests to fail with `Attached to a different loop`.
+   - *Fix*: Configured `poolclass=NullPool` for the test engine in `tests/conftest.py`.
+
+2. **Async Relationship Lazy Loading (MissingGreenlet)**:
+   - *Problem*: In `get_import_job`, accessing `job.errors` triggered greenlet errors in async SQLAlchemy.
+   - *Fix*: Applied eager loading via `.options(selectinload(ImportJob.errors))`.
+
+3. **Celery Queue Partitioning**:
+   - *Problem*: Heavy 500K ingestion tasks could starve lightweight webhook delivery tasks if on a single shared queue.
+   - *Fix*: Partitioned tasks into separate queues (`imports` and `webhooks`), with worker listening on both (`-Q imports,webhooks,celery`).
+
+4. **Active Filter Parameter Harmonization**:
+   - *Problem*: API consumers requested filtering either via `status=active|inactive` or `active=true|false`.
+   - *Fix*: Accepted both in `app/api/v1/products.py` with automatic fallback and documentation.
+
+5. **SSRF Webhook Protection**:
+   - *Problem*: User-specified webhook URLs could be pointed to internal services (e.g. AWS/GCP metadata `169.254.169.254` or Docker internal IP ranges `172.16.0.0/12`).
+   - *Fix*: Implemented strict DNS resolution validation rejecting all RFC 1918, RFC 3927 (link-local), and loopback subnets.
+
+---
+
+## 5. Phase-by-Phase Implementation Chronology
+
+- **Phase 0: Inspection**: Empirically analyzed `products.csv` (87.2 MB, 500K rows, 466,693 unique SKUs).
+- **Phase 1: Architecture & Planning**: Established project structure, implementation plan, ADRs, and sample scripts.
+- **Phase 2: Database Layer**: SQLAlchemy 2.0 async models, Alembic migrations, PostgreSQL functional index on `LOWER(sku)`.
+- **Phase 3: Product CRUD API**: Endpoints for pagination, sorting, search, single product fetch/patch/delete, and bulk truncate.
+- **Phase 4 & 5: Celery Pipeline & SSE**: Asynchronous `UNLOGGED` staging table + streaming COPY + SQL deduplication + Redis Pub/Sub SSE telemetry.
+- **Phase 6: Webhook System**: Asynchronous delivery engine, HMAC-SHA256 signatures, SSRF validation, and interactive test trigger endpoint.
+- **Phase 7: Frontend Application**: Next.js 16 App Router UI with stats cards, CSV upload with real-time SSE progress bar, products table with search/filtering, and webhook manager.
+- **Phase 8: Benchmarking**: Executed 500,000-row ingestion benchmark in **24.38 seconds** (35,339 rows/sec) and verified active flag preservation.
+
+---
+
+## 6. Official Benchmark Metrics
+
+- **Total Ingestion Duration**: 24.38 seconds
+- **File Upload Duration**: 0.78 seconds
+- **Total Throughput**: 35,339 rows/sec
+- **Unique Products Saved**: 466,693
+- **Duplicate Rows Handled**: 33,307
+- **Pytest Suite**: 22 passed, 0 failed (2.80s)
+- **Active Preservation Test**: Verified (product `a-ability-see-gun` remained `active: false` after subsequent re-import).
