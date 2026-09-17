@@ -7,8 +7,13 @@ import {
 } from "@/types";
 
 export function getApiBaseUrl(): string {
-  if (process.env.NEXT_PUBLIC_API_URL) {
-    return process.env.NEXT_PUBLIC_API_URL.replace(/\/+$/, "");
+  let url = process.env.NEXT_PUBLIC_API_URL;
+  if (url) {
+    url = url.trim().replace(/\/+$/, "");
+    if (!url.endsWith("/api/v1")) {
+      url = `${url}/api/v1`;
+    }
+    return url;
   }
   if (typeof window !== "undefined") {
     return "/api/v1";
@@ -54,7 +59,7 @@ async function handleResponse<T>(res: Response): Promise<T> {
 // ----------------------------------------------------
 export async function getHealth(): Promise<{ status: string; database?: string; redis?: string }> {
   try {
-    const rootUrl = API_BASE_URL.replace("/api/v1", "");
+    const rootUrl = API_BASE_URL.replace(/\/api\/v1\/?$/, "");
     const res = await fetch(`${rootUrl}/ready`, { cache: "no-store" });
     return handleResponse(res);
   } catch {
