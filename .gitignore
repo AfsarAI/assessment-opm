@@ -54,6 +54,8 @@ pgdata/
 *.sqlite3
 backend/uploads/*
 !backend/uploads/.gitkeep
+uploads/*
+!uploads/.gitkeep
 
 # IDE & OS
 .idea/

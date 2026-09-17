@@ -157,3 +157,91 @@ async def test_get_import_job_and_progress_sse(client: AsyncClient, db_session: 
     assert "text/event-stream" in sse_res.headers["content-type"]
     assert "event: progress" in sse_res.text
     assert '"status": "COMPLETED"' in sse_res.text
+
+
+@pytest.mark.asyncio
+async def test_case_insensitive_latest_wins_deduplication(client: AsyncClient, db_session: AsyncSession, tmp_path):
+    await db_session.execute(text("TRUNCATE TABLE products RESTART IDENTITY;"))
+    await db_session.commit()
+
+    # Create CSV with 5 occurrences of the same SKU with varying casing
+    csv_file = tmp_path / "case_dedup.csv"
+    content = (
+        "name,sku,description\n"
+        "V1,ABC-999,First occurrence\n"
+        "V2,abc-999,Second occurrence\n"
+        "V3,Abc-999,Third occurrence\n"
+        "V4,aBc-999,Fourth occurrence\n"
+        "V5 WINNER,ABc-999,Final winner description\n"
+    )
+    csv_file.write_text(content, encoding="utf-8")
+
+    job_id = uuid.uuid4()
+    job = ImportJob(id=job_id, filename="case_dedup.csv", status="QUEUED")
+    db_session.add(job)
+    await db_session.commit()
+
+    execute_import_pipeline(str(job_id), str(csv_file))
+
+    db_session.expire_all()
+    res = await db_session.execute(select(Product))
+    products = list(res.scalars().all())
+
+    # Must collapse to exactly 1 product
+    assert len(products) == 1
+    assert products[0].name == "V5 WINNER"
+    assert products[0].description == "Final winner description"
+    assert products[0].sku == "ABc-999"
+
+
+@pytest.mark.asyncio
+async def test_failed_import_does_not_report_staged_as_succeeded(client: AsyncClient, db_session: AsyncSession, tmp_path):
+    from unittest.mock import patch
+
+    csv_file = tmp_path / "faulty_import.csv"
+    csv_file.write_text(
+        "name,sku,description\n"
+        "Item 1,SKU-1,Desc 1\n"
+        "Item 2,SKU-2,Desc 2\n",
+        encoding="utf-8"
+    )
+
+    job_id = uuid.uuid4()
+    job = ImportJob(id=job_id, filename="faulty_import.csv", status="QUEUED")
+    db_session.add(job)
+    await db_session.commit()
+
+    # Simulate an error specifically during catalogue merge after staging
+    from app.services import import_service
+    original_connect = import_service.sync_engine.connect
+
+    class FailOnMergeConnection:
+        def __init__(self, real_conn):
+            self._real = real_conn
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+        def __enter__(self):
+            self._real.__enter__()
+            return self
+        def __exit__(self, *args):
+            return self._real.__exit__(*args)
+        def execute(self, statement, *args, **kwargs):
+            if "INSERT INTO products" in str(statement):
+                raise Exception("Simulated SSL EOF / DB disconnect during merge")
+            return self._real.execute(statement, *args, **kwargs)
+
+    def mock_connect(*args, **kwargs):
+        return FailOnMergeConnection(original_connect(*args, **kwargs))
+
+    with pytest.raises(Exception):
+        with patch.object(import_service.sync_engine, "connect", side_effect=mock_connect):
+            execute_import_pipeline(str(job_id), str(csv_file))
+
+    db_session.expire_all()
+    res = await db_session.execute(select(ImportJob).where(ImportJob.id == job_id))
+    failed_job = res.scalar_one()
+    assert failed_job.status == "FAILED"
+    # CRITICAL: successful_rows must be 0, NOT 2!
+    assert failed_job.successful_rows == 0
+    assert failed_job.error_message is not None
+

@@ -19,12 +19,15 @@ def generate_samples(source_csv="products.csv", output_dir="scripts/samples"):
         header = next(reader)
         
         rows_100 = []
+        rows_1k = []
         rows_10k = []
         rows_100k = []
         
         for idx, row in enumerate(reader, 1):
             if idx <= 100:
                 rows_100.append(row)
+            if idx <= 1000:
+                rows_1k.append(row)
             if idx <= 10000:
                 rows_10k.append(row)
             if idx <= 100000:
@@ -32,7 +35,7 @@ def generate_samples(source_csv="products.csv", output_dir="scripts/samples"):
             if idx == 100000:
                 break
 
-    for count, data in [(100, rows_100), (10000, rows_10k), (100000, rows_100k)]:
+    for count, data in [(100, rows_100), (1000, rows_1k), (10000, rows_10k), (100000, rows_100k)]:
         out_path = os.path.join(output_dir, f"products_{count}.csv")
         with open(out_path, "w", newline="", encoding="utf-8") as out:
             writer = csv.writer(out)

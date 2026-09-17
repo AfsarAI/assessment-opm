@@ -96,10 +96,10 @@ All 22 tests covering health checks, upload validation, Celery execution, dedupl
 
 ### Verified Live Endpoints
 - **Production Frontend (Vercel)**: [https://assessment-opm.vercel.app/](https://assessment-opm.vercel.app/)
-- **Production Backend API (Render)**: [https://opm-backend-p1i8.onrender.com](https://opm-backend-p1i8.onrender.com)
-- **OpenAPI / Swagger Interactive Documentation**: [https://opm-backend-p1i8.onrender.com/docs](https://opm-backend-p1i8.onrender.com/docs)
-- **Readiness Check (PostgreSQL & Redis)**: [https://opm-backend-p1i8.onrender.com/ready](https://opm-backend-p1i8.onrender.com/ready)
-- **Liveness Check**: [https://opm-backend-p1i8.onrender.com/health](https://opm-backend-p1i8.onrender.com/health)
+- **Production Backend API (Render)**: [https://opm-backend-rf77.onrender.com](https://opm-backend-rf77.onrender.com)
+- **OpenAPI / Swagger Interactive Documentation**: [https://opm-backend-rf77.onrender.com/docs](https://opm-backend-rf77.onrender.com/docs)
+- **Readiness Check (PostgreSQL & Redis)**: [https://opm-backend-rf77.onrender.com/ready](https://opm-backend-rf77.onrender.com/ready)
+- **Liveness Check**: [https://opm-backend-rf77.onrender.com/health](https://opm-backend-rf77.onrender.com/health)
 
 ### Verification Matrix on Public HTTPS
 

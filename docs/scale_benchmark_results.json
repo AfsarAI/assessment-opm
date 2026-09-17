@@ -1,0 +1,72 @@
+[
+  {
+    "label": "100 rows",
+    "file": "products_100.csv",
+    "size_mb": 0.02,
+    "duration": 0.323,
+    "total_rows": 100,
+    "successful_rows": 100,
+    "failed_rows": 0,
+    "product_count": 100,
+    "throughput_rows_sec": 310.0,
+    "status": "COMPLETED",
+    "inactive_preserved": true,
+    "name_updated": true
+  },
+  {
+    "label": "1,000 rows",
+    "file": "products_1000.csv",
+    "size_mb": 0.17,
+    "duration": 0.16,
+    "total_rows": 1000,
+    "successful_rows": 999,
+    "failed_rows": 0,
+    "product_count": 999,
+    "throughput_rows_sec": 6238.8,
+    "status": "COMPLETED",
+    "inactive_preserved": true,
+    "name_updated": true
+  },
+  {
+    "label": "10,000 rows",
+    "file": "products_10000.csv",
+    "size_mb": 1.72,
+    "duration": 0.634,
+    "total_rows": 10000,
+    "successful_rows": 9946,
+    "failed_rows": 0,
+    "product_count": 9946,
+    "throughput_rows_sec": 15774.4,
+    "status": "COMPLETED",
+    "inactive_preserved": true,
+    "name_updated": true
+  },
+  {
+    "label": "100,000 rows",
+    "file": "products_100000.csv",
+    "size_mb": 17.26,
+    "duration": 5.814,
+    "total_rows": 100000,
+    "successful_rows": 97793,
+    "failed_rows": 0,
+    "product_count": 97793,
+    "throughput_rows_sec": 17201.0,
+    "status": "COMPLETED",
+    "inactive_preserved": true,
+    "name_updated": true
+  },
+  {
+    "label": "500,000 rows",
+    "file": "products.csv",
+    "size_mb": 86.37,
+    "duration": 27.715,
+    "total_rows": 500000,
+    "successful_rows": 466693,
+    "failed_rows": 0,
+    "product_count": 466693,
+    "throughput_rows_sec": 18041.1,
+    "status": "COMPLETED",
+    "inactive_preserved": true,
+    "name_updated": true
+  }
+]

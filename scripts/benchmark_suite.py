@@ -10,7 +10,7 @@ import time
 import json
 import requests
 
-API_BASE = "https://opm-backend-p1i8.onrender.com"
+API_BASE = "https://opm-backend-rf77.onrender.com"
 
 FILES = [
     ("100 rows", "sample_100.csv"),

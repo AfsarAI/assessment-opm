@@ -12,6 +12,15 @@ async_engine = create_async_engine(
     pool_size=20,
     max_overflow=10,
     pool_pre_ping=True,
+    pool_recycle=300,
+    pool_timeout=30,
+    connect_args={
+        "server_settings": {
+            "tcp_keepalives_idle": "30",
+            "tcp_keepalives_interval": "10",
+            "tcp_keepalives_count": "5",
+        }
+    },
 )
 
 AsyncSessionLocal = async_sessionmaker(
@@ -29,6 +38,14 @@ sync_engine = create_engine(
     pool_size=10,
     max_overflow=5,
     pool_pre_ping=True,
+    pool_recycle=300,
+    pool_timeout=30,
+    connect_args={
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 5,
+    },
 )
 
 SyncSessionLocal = sessionmaker(

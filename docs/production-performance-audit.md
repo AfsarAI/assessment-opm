@@ -1,7 +1,7 @@
 # Production Performance Audit & Optimization Report
 **System**: Assessment OPM — 500K Product Ingestion Engine  
 **Live Frontend**: `https://assessment-opm.vercel.app/`  
-**Live Backend**: `https://opm-backend-p1i8.onrender.com`  
+**Live Backend**: `https://opm-backend-rf77.onrender.com`  
 **Production Dataset**: `products.csv` (90,569,310 bytes / 86.37 MB, 500,000 logical records)  
 **Execution Date**: September 17, 2026
 
@@ -90,7 +90,7 @@ Deep tracing across the backend state machine, Celery worker, PostgreSQL query p
 
 ## 4. Complete Lifecycle Timestamps (T0 – T17) on 500K Products
 
-Captured on the LIVE production deployment (`https://opm-backend-p1i8.onrender.com`) using `scripts/measure_live_import.py`:
+Captured on the LIVE production deployment (`https://opm-backend-rf77.onrender.com`) using `scripts/measure_live_import.py`:
 
 ```
 ==================================================
@@ -121,7 +121,7 @@ Final Product Count                 : 466,694 unique products
 
 ## 5. Multi-Size Production Benchmark Results
 
-All benchmarks executed live against `https://opm-backend-p1i8.onrender.com` with real CSV files:
+All benchmarks executed live against `https://opm-backend-rf77.onrender.com` with real CSV files:
 
 | File Size / Rows | File Bytes | Upload Time | Backend Import Time | Total Time | Throughput (Rows/s) | SSE Events | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |

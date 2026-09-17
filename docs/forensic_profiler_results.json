@@ -1,0 +1,16 @@
+{
+  "CSV row count (csv.reader)": 0.7628,
+  "CREATE UNLOGGED TABLE": 0.0108,
+  "COPY + parse + TSV escape": 3.8789,
+  "CREATE INDEX lower(sku)": 0.9637,
+  "CREATE INDEX lower(sku), row_num DESC (composite)": 0.9015,
+  "EXPLAIN ANALYZE DISTINCT ON (with index + 128MB work_mem)": 1.3394,
+  "DISTINCT ON actual execution (128MB work_mem)": 2.4198,
+  "DISTINCT ON without composite index": 3.2071,
+  "ROW_NUMBER() dedup (128MB work_mem)": 2.9498,
+  "UPSERT into EMPTY products (all INSERTs)": 28.1725,
+  "UPSERT into FULL products (all UPDATEs + active preservation)": 28.6291,
+  "UPSERT with WHERE skip unchanged": 28.4364,
+  "UPSERT into sku_normalized table (UNLOGGED, fresh)": 13.8085,
+  "DROP TABLE staging": 0.0415
+}

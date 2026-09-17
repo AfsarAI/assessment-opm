@@ -8,7 +8,7 @@
 [![Docker](https://img.shields.io/badge/Docker_Compose-v2-2496ED.svg?logo=docker&logoColor=white)](https://www.docker.com)
 [![Tests](https://img.shields.io/badge/Pytest-22%2F22_Passed-success.svg)](backend/tests)
 [![Live Frontend](https://img.shields.io/badge/Vercel-Live_App-black.svg?logo=vercel&logoColor=white)](https://assessment-opm.vercel.app/)
-[![Live Backend](https://img.shields.io/badge/Render-Live_API-46E3B7.svg?logo=render&logoColor=white)](https://opm-backend-p1i8.onrender.com/docs)
+[![Live Backend](https://img.shields.io/badge/Render-Live_API-46E3B7.svg?logo=render&logoColor=white)](https://opm-backend-rf77.onrender.com/docs)
 
 A production-grade, asynchronous web application capable of streaming, validating, deduplicating, and importing a **500,000-row CSV file** into PostgreSQL without blocking the API server. Features real-time Server-Sent Events (SSE) progress tracking, product management (CRUD, case-insensitive SKU uniqueness, filtering, pagination), bulk truncation with safety confirmations, and an asynchronous webhook delivery engine with interactive testing and SSRF protection.
 
@@ -17,9 +17,9 @@ A production-grade, asynchronous web application capable of streaming, validatin
 ## Live Production URLs
 
 - **Frontend Application (Vercel)**: [https://assessment-opm.vercel.app/](https://assessment-opm.vercel.app/)
-- **Backend API & Swagger Docs (Render)**: [https://opm-backend-p1i8.onrender.com/docs](https://opm-backend-p1i8.onrender.com/docs)
-- **API Readiness Check**: [https://opm-backend-p1i8.onrender.com/ready](https://opm-backend-p1i8.onrender.com/ready)
-- **API Liveness Check**: [https://opm-backend-p1i8.onrender.com/health](https://opm-backend-p1i8.onrender.com/health)
+- **Backend API & Swagger Docs (Render)**: [https://opm-backend-rf77.onrender.com/docs](https://opm-backend-rf77.onrender.com/docs)
+- **API Readiness Check**: [https://opm-backend-rf77.onrender.com/ready](https://opm-backend-rf77.onrender.com/ready)
+- **API Liveness Check**: [https://opm-backend-rf77.onrender.com/health](https://opm-backend-rf77.onrender.com/health)
 
 ---
 

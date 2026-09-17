@@ -4,8 +4,8 @@ import sys
 import os
 import requests
 
-BACKEND_URL = "https://opm-backend-p1i8.onrender.com"
-CSV_FILE = "products.csv"
+BACKEND_URL = "https://opm-backend-rf77.onrender.com"
+CSV_FILE = sys.argv[1] if len(sys.argv) > 1 else "products.csv"
 
 def run_live_measurement():
     print("==================================================")
