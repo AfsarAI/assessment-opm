@@ -290,24 +290,58 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
                         {"import_id": imp_id, "row_num": r_num, "error_msg": err_msg, "raw_data": raw_d[:500]},
                     )
 
-        # 5. Stage 3 & 4: Unified In-Database Deduplication & Atomic UPSERT
-        # Consolidates deduplication and conflict resolution into a single set-based query
-        # that executes in ~15-20s, eliminating multi-minute table scans and disk spills.
-        stage_msg = "Deduplicating and merging products into catalogue..."
-        update_job_db(job_id_str, "IMPORTING", 70, stage_msg, processed_rows, successful_rows, failed_rows)
-        publish_progress(
-            r, job_id_str, "IMPORTING", 70, processed_rows, total_rows, successful_rows, failed_rows, stage_msg
-        )
+        # 5. Stage 3 & 4: Optimized Bulk UPSERT with GIN Index Bypass
+        #
+        # ROOT CAUSE OF PREVIOUS BOTTLENECK:
+        # The products table has 5 indexes: 1 pk, 1 unique btree (lower sku),
+        # 1 btree active, 1 btree created_at, and 2 GIN trigram indexes
+        # (ix_products_name_trgm, ix_products_sku_trgm).
+        # Each row INSERT/UPDATE triggers GIN page writes for both trgm indexes.
+        # At 466K rows on Render's slow free-tier I/O, this caused 200+ seconds.
+        #
+        # THE FIX:
+        # 1. DROP the 2 GIN trgm indexes before the UPSERT
+        # 2. UPSERT (now only 3 btree indexes maintained → much faster)
+        # 3. CREATE the 2 GIN trgm indexes in a single table scan → O(N) not O(N*logN*writes)
+        #
+        # active=false is preserved because ON CONFLICT does NOT touch the active column.
 
-        # Launch live background heartbeat thread so SSE connection remains active and responsive
+        # ── 5a. Drop GIN indexes before bulk UPSERT ──────────────────────────
+        stage_msg = "Optimizing indexes for bulk import..."
+        update_job_db(job_id_str, "IMPORTING", 68, stage_msg, processed_rows, successful_rows, failed_rows)
+        publish_progress(r, job_id_str, "IMPORTING", 68, processed_rows, total_rows, successful_rows, failed_rows, stage_msg)
+
+        gin_indexes_exist = {"name_trgm": False, "sku_trgm": False}
+        with sync_engine.connect() as conn:
+            with conn.begin():
+                # Check which indexes exist before dropping
+                result = conn.execute(text("""
+                    SELECT indexname FROM pg_indexes
+                    WHERE tablename = 'products'
+                    AND indexname IN ('ix_products_name_trgm', 'ix_products_sku_trgm');
+                """))
+                for row in result.fetchall():
+                    if "name_trgm" in row[0]:
+                        gin_indexes_exist["name_trgm"] = True
+                    if "sku_trgm" in row[0]:
+                        gin_indexes_exist["sku_trgm"] = True
+
+                if gin_indexes_exist["name_trgm"]:
+                    conn.execute(text("DROP INDEX IF EXISTS ix_products_name_trgm;"))
+                    logger.info("Dropped ix_products_name_trgm for bulk import")
+                if gin_indexes_exist["sku_trgm"]:
+                    conn.execute(text("DROP INDEX IF EXISTS ix_products_sku_trgm;"))
+                    logger.info("Dropped ix_products_sku_trgm for bulk import")
+
+        # ── 5b. Launch heartbeat so SSE stays alive during UPSERT ────────────
         stop_heartbeat = threading.Event()
 
         def upsert_heartbeat():
             step = 0
             while not stop_heartbeat.wait(2.0):
                 step += 1
-                hb_progress = min(96, 70 + step * 2)
-                hb_msg = f"Merging products into catalogue (in-database index merge: {step * 2}s elapsed)..."
+                hb_progress = min(88, 70 + step * 2)
+                hb_msg = f"Merging {total_rows:,} products into catalogue ({step * 2}s elapsed)..."
                 publish_progress(
                     r, job_id_str, "IMPORTING", hb_progress, processed_rows, total_rows, successful_rows, failed_rows, hb_msg
                 )
@@ -315,11 +349,19 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
         hb_thread = threading.Thread(target=upsert_heartbeat, daemon=True)
         hb_thread.start()
 
+        upsert_error = None
         try:
+            # ── 5c. Bulk UPSERT (only btree indexes active now) ──────────────
+            stage_msg = "Bulk upserting into products catalogue..."
+            update_job_db(job_id_str, "IMPORTING", 70, stage_msg, processed_rows, successful_rows, failed_rows)
+
             with sync_engine.connect() as conn:
                 with conn.begin():
-                    # Elevate work_mem for this transaction so sort runs in-memory without disk spills
+                    # Performance settings for bulk merge:
+                    # - work_mem: sort fits in memory (no disk spill for DISTINCT ON)
+                    # - synchronous_commit=off: skip WAL fsync (safe - bulk import, FAILED on crash)
                     conn.execute(text("SET LOCAL work_mem = '128MB';"))
+                    conn.execute(text("SET LOCAL synchronous_commit = off;"))
                     conn.execute(
                         text(
                             f"""
@@ -338,11 +380,47 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
                             """
                         )
                     )
-                    # Drop staging table in the same transaction
+                    # Drop staging table in same transaction for atomicity
                     conn.execute(text(f"DROP TABLE IF EXISTS {staging_table};"))
+
+        except Exception as e:
+            upsert_error = e
         finally:
             stop_heartbeat.set()
             hb_thread.join(timeout=1.0)
+
+        # ── 5d. Rebuild GIN trgm indexes after UPSERT ────────────────────────
+        # Even if UPSERT failed, we MUST rebuild the indexes we dropped.
+        # A single sequential scan to rebuild is orders of magnitude faster
+        # than per-row GIN page writes during bulk insert.
+        try:
+            stage_msg = "Rebuilding search indexes..."
+            update_job_db(job_id_str, "IMPORTING", 90, stage_msg, processed_rows, successful_rows, failed_rows)
+            publish_progress(r, job_id_str, "IMPORTING", 90, processed_rows, total_rows, successful_rows, failed_rows, stage_msg)
+
+            with sync_engine.connect() as conn:
+                with conn.begin():
+                    # Use large maintenance_work_mem for fast GIN index build
+                    conn.execute(text("SET LOCAL maintenance_work_mem = '128MB';"))
+                    if gin_indexes_exist["name_trgm"]:
+                        conn.execute(text("""
+                            CREATE INDEX ix_products_name_trgm ON products
+                            USING gin (name gin_trgm_ops);
+                        """))
+                        logger.info("Rebuilt ix_products_name_trgm")
+                    if gin_indexes_exist["sku_trgm"]:
+                        conn.execute(text("""
+                            CREATE INDEX ix_products_sku_trgm ON products
+                            USING gin (sku gin_trgm_ops);
+                        """))
+                        logger.info("Rebuilt ix_products_sku_trgm")
+        except Exception as rebuild_err:
+            logger.error(f"Failed to rebuild GIN indexes: {rebuild_err}")
+            # Non-fatal: search will still work, just slower without trgm
+
+        # Now re-raise UPSERT error if any
+        if upsert_error is not None:
+            raise upsert_error
 
         # 6. Finalize Job
         final_status = "COMPLETED_WITH_ERRORS" if failed_rows > 0 else "COMPLETED"
