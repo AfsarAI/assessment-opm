@@ -32,14 +32,14 @@ fi
 # 3. Handle service types
 if [ "$SERVICE_TYPE" = "worker" ]; then
     echo "Starting standalone Celery worker..."
-    exec celery -A app.core.celery_app.celery_app worker --loglevel=info --concurrency=2 -Q imports,webhooks,celery
+    exec celery -A app.core.celery_app.celery_app worker --loglevel=info --concurrency=1 -Q imports,webhooks,celery
 elif [ "$SERVICE_TYPE" = "web" ]; then
     echo "Starting standalone Uvicorn API server on port ${PORT}..."
     exec uvicorn app.main:app --host 0.0.0.0 --port "${PORT}"
 else
     # Unified 'all' mode: Run Celery worker in background, Uvicorn in foreground
-    echo "Starting Celery worker in background (concurrency=2)..."
-    celery -A app.core.celery_app.celery_app worker --loglevel=info --concurrency=2 -Q imports,webhooks,celery &
+    echo "Starting Celery worker in background (concurrency=1)..."
+    celery -A app.core.celery_app.celery_app worker --loglevel=info --concurrency=1 -Q imports,webhooks,celery &
     WORKER_PID=$!
     echo "✓ Celery worker started with PID ${WORKER_PID}."
 

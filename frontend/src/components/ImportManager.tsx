@@ -272,13 +272,18 @@ export const ImportManager: React.FC = () => {
         <div className="mt-6 flex justify-end">
           <button
             onClick={handleUpload}
-            disabled={!file || isUploading}
+            disabled={!file || isUploading || !!(activeJob && !["COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED"].includes(activeJob.status))}
             className="flex items-center gap-2 rounded-lg bg-indigo-600 px-5 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
           >
             {isUploading ? (
               <>
                 <RefreshCw className="h-4 w-4 animate-spin" />
                 <span>Uploading ({uploadProgress ? `${uploadProgress.percent}%` : "..."})</span>
+              </>
+            ) : activeJob && !["COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED"].includes(activeJob.status) ? (
+              <>
+                <RefreshCw className="h-4 w-4 animate-spin" />
+                <span>Ingestion in Progress...</span>
               </>
             ) : (
               <span>Start Ingestion</span>

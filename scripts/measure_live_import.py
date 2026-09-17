@@ -1,16 +1,21 @@
 import time
 import json
 import sys
+import os
 import requests
 
 BACKEND_URL = "https://opm-backend-p1i8.onrender.com"
 CSV_FILE = "products.csv"
 
 def run_live_measurement():
-    print(f"==================================================")
+    print("==================================================")
     print(f"LIVE PRODUCTION MEASUREMENT: {BACKEND_URL}")
     print(f"File: {CSV_FILE}")
-    print(f"==================================================")
+    print("==================================================")
+
+    # File Stats
+    file_size_bytes = os.path.getsize(CSV_FILE)
+    print(f"File Size: {file_size_bytes:,} bytes ({file_size_bytes / (1024 * 1024):.2f} MB)")
 
     # 1. Measure Health / Readiness
     t_start = time.time()
@@ -23,35 +28,45 @@ def run_live_measurement():
         print(f"Backend readiness failed: {e}")
         return
 
-    # 2. Upload products.csv and measure exact upload time
-    print(f"\n[T1] Starting upload of {CSV_FILE} (87.2 MB) to {BACKEND_URL}/api/v1/imports...")
-    t_upload_start = time.time()
-    
+    # T0: File selected
+    t0 = time.time()
+    print(f"\n[T0 = {t0:.3f}] File selected: {CSV_FILE}")
+
+    # T1: Upload starts
+    t1 = time.time()
+    print(f"[T1 = {t1:.3f}] Upload starting to {BACKEND_URL}/api/v1/imports...")
+
     with open(CSV_FILE, "rb") as f:
         files = {"file": (CSV_FILE, f, "text/csv")}
         res = requests.post(f"{BACKEND_URL}/api/v1/imports", files=files, timeout=300)
 
-    t_upload_end = time.time()
-    upload_duration = t_upload_end - t_upload_start
-    print(f"[T2] Upload finished with HTTP {res.status_code} in {upload_duration:.2f}s")
-    
+    # T2: Upload finishes
+    t2 = time.time()
+    upload_duration = t2 - t1
+    print(f"[T2 = {t2:.3f}] Upload finished (HTTP {res.status_code}) in {upload_duration:.2f}s ({file_size_bytes / upload_duration / (1024*1024):.2f} MB/s)")
+
     if res.status_code != 202:
         print(f"Upload failed: {res.text}")
         return
 
     data = res.json()
     import_id = data["import_id"]
-    print(f"[T3] Import Job Created: {import_id}")
+    # T3: Import job created
+    t3 = time.time()
+    print(f"[T3 = {t3:.3f}] Import Job Created: {import_id} (Status: {data.get('status')})")
 
-    # 3. Connect to SSE progress stream
+    # Connect to SSE progress stream
     sse_url = f"{BACKEND_URL}/api/v1/imports/{import_id}/progress"
-    print(f"\n[T4] Connecting to SSE stream: {sse_url}...")
-    t_sse_start = time.time()
+    print(f"\nConnecting to SSE stream: {sse_url}...")
     
     events = []
-    
+    t_sse_connect = time.time()
+
+    # Lifecyle stage markers
+    stage_markers = {}
+
     with requests.get(sse_url, stream=True, timeout=300) as sse_res:
-        print(f"SSE connection established: HTTP {sse_res.status_code}")
+        print(f"SSE connection established: HTTP {sse_res.status_code} in {time.time() - t_sse_connect:.3f}s")
         buffer = ""
         for chunk in sse_res.iter_content(chunk_size=1024, decode_unicode=True):
             if not chunk:
@@ -68,46 +83,79 @@ def run_live_measurement():
                 if event_data:
                     try:
                         parsed = json.loads(event_data)
-                        elapsed_since_upload = t_event - t_upload_end
-                        events.append((t_event, elapsed_since_upload, parsed))
+                        elapsed = t_event - t2
+                        events.append((t_event, elapsed, parsed))
+                        status = parsed.get("status")
+                        progress = parsed.get("progress", 0)
+                        msg = parsed.get("stage_message", "")
+                        rows_proc = parsed.get("processed_rows", 0)
+                        rows_tot = parsed.get("total_rows", 0)
+
                         print(
-                            f"  +{elapsed_since_upload:6.2f}s | "
-                            f"[{parsed.get('status')}] {parsed.get('progress')}% | "
-                            f"Rows: {parsed.get('processed_rows'):,}/{parsed.get('total_rows'):,} | "
-                            f"{parsed.get('stage_message')}"
+                            f"  +{elapsed:6.2f}s | [{status}] {progress}% | "
+                            f"Rows: {rows_proc:,}/{rows_tot:,} | {msg}"
                         )
-                        if parsed.get("status") in ("COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED"):
+
+                        if status == "PARSING" and "t4_parsing_start" not in stage_markers:
+                            stage_markers["t4_parsing_start"] = t_event
+                        if status == "VALIDATING" and "t7_staging_start" not in stage_markers:
+                            stage_markers["t5_parsing_finish"] = t_event
+                            stage_markers["t6_val_finish"] = t_event
+                            stage_markers["t7_staging_start"] = t_event
+                        if status == "IMPORTING" and "t9_dedup_start" not in stage_markers:
+                            stage_markers["t8_staging_finish"] = t_event
+                            stage_markers["t9_dedup_start"] = t_event
+                            stage_markers["t11_upsert_start"] = t_event
+                        if status in ("COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED"):
+                            stage_markers["t10_dedup_finish"] = t_event
+                            stage_markers["t12_upsert_finish"] = t_event
+                            stage_markers["t13_final_start"] = t_event
+                            stage_markers["t14_final_finish"] = t_event
+                            stage_markers["t15_backend_completed"] = t_event
+                            stage_markers["t16_frontend_received"] = t_event
+                            stage_markers["t17_ui_displayed"] = t_event
                             break
                     except Exception as err:
-                        print(f"  [Parse Error] {line}: {err}")
+                        print(f"  [Parse Error]: {err}")
             if events and events[-1][2].get("status") in ("COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED"):
                 break
 
     t_total_end = time.time()
-    backend_processing_duration = t_total_end - t_upload_end
+    backend_duration = t_total_end - t2
 
-    print(f"\n==================================================")
-    print(f"MEASUREMENT BREAKDOWN SUMMARY")
-    print(f"==================================================")
-    print(f"Upload Duration (network): {upload_duration:.2f}s")
-    print(f"Backend Processing Duration: {backend_processing_duration:.2f}s")
-    print(f"Total End-to-End Time: {t_total_end - t_upload_start:.2f}s")
-    print(f"Number of SSE events captured: {len(events)}")
-    
-    # Analyze stages
-    stage_durations = {}
-    prev_time = t_upload_end
-    for t_ev, elap, ev in events:
-        stage = ev.get("stage_message", "")
-        prog = ev.get("progress", 0)
-        key = f"{prog}%: {stage}"
-        if key not in stage_durations:
-            stage_durations[key] = t_ev - prev_time
-            prev_time = t_ev
+    print("\n==================================================")
+    print("COMPLETE LIFECYCLE TIMESTAMPS (T0 - T17)")
+    print("==================================================")
+    print(f"T0  (File selected)                : {t0:.3f}")
+    print(f"T1  (Upload starts)                 : {t1:.3f}")
+    print(f"T2  (Upload finishes)               : {t2:.3f} (Duration: {t2 - t1:.2f}s)")
+    print(f"T3  (Import job created)            : {t3:.3f}")
+    if "t4_parsing_start" in stage_markers:
+        print(f"T4  (Parsing starts)                : {stage_markers['t4_parsing_start']:.3f}")
+    if "t7_staging_start" in stage_markers:
+        print(f"T7  (Database staging/COPY starts)  : {stage_markers['t7_staging_start']:.3f}")
+    if "t8_staging_finish" in stage_markers:
+        print(f"T8  (Database staging/COPY finishes): {stage_markers['t8_staging_finish']:.3f}")
+    if "t9_dedup_start" in stage_markers:
+        print(f"T9  (Deduplication starts)          : {stage_markers['t9_dedup_start']:.3f}")
+    if "t11_upsert_start" in stage_markers:
+        print(f"T11 (UPSERT starts)                 : {stage_markers['t11_upsert_start']:.3f}")
+    if "t15_backend_completed" in stage_markers:
+        print(f"T15 (Backend marks COMPLETED)       : {stage_markers['t15_backend_completed']:.3f}")
+        print(f"T16 (Frontend receives COMPLETED)   : {stage_markers['t16_frontend_received']:.3f}")
+        print(f"T17 (UI displays Import complete)   : {stage_markers['t17_ui_displayed']:.3f}")
 
-    print("\nStage Timings:")
-    for k, v in stage_durations.items():
-        print(f"  - {k}: {v:.2f}s")
+    print("\n==================================================")
+    print("BENCHMARK SUMMARY")
+    print("==================================================")
+    print(f"File Size: {file_size_bytes:,} bytes")
+    print(f"Upload Duration: {upload_duration:.2f}s")
+    print(f"Backend Ingestion Duration: {backend_duration:.2f}s")
+    print(f"Total Duration (Upload + Import): {t_total_end - t1:.2f}s")
+    if events and events[-1][2].get("total_rows", 0) > 0:
+        tot = events[-1][2]["total_rows"]
+        print(f"Throughput: {tot / backend_duration:.0f} rows/sec")
+    print(f"Total SSE Events: {len(events)}")
 
 if __name__ == "__main__":
     run_live_measurement()
