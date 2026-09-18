@@ -1,36 +1,83 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Assessment OPM: Frontend Application
 
-## Getting Started
+A responsive, real-time web interface for **Assessment OPM**, built with **Next.js 16 (App Router)**, **TypeScript**, and **Tailwind CSS**.
 
-First, run the development server:
+---
 
+## Key Features
+
+1. **Interactive Dashboard (`Dashboard.tsx`)**:
+   - Real-time catalog metrics (total products, active ratio, recent imports).
+   - System health status indicator communicating directly with backend `/health` and `/ready` endpoints.
+2. **CSV Import Manager (`ImportManager.tsx`)**:
+   - Drag-and-drop CSV file uploader supporting up to 250 MB.
+   - Real-time progress bar powered by **Server-Sent Events (SSE)** with monotonic progress guarantees ($P_{t+1} \ge P_t$) and sequence number tracking.
+   - Stage indicators: *Parsing CSV*, *Validating & Staging*, *Catalogue UPSERT*, *Rebuilding Indexes*, and *Completed*.
+   - Dynamic import cancellation with instant backend process termination (`pg_cancel_backend`).
+   - Recent import jobs table with real-time status updates and modal error inspector.
+3. **Product Catalog Manager (`ProductManager.tsx`)**:
+   - Server-side paginated product table (10, 25, 50, 100 per page).
+   - Real-time search by SKU or Name powered by PostgreSQL `pg_trgm` GIN indexes.
+   - Status filtering (All, Active, Inactive) and multi-column sorting.
+   - Single-product CRUD modals with client & server validation (409 Conflict handling for duplicate SKUs).
+   - Instant active/inactive status toggle.
+   - Safe bulk catalogue clear with typed confirmation (`DELETE ALL`).
+4. **Webhook Manager (`WebhookManager.tsx`)**:
+   - Create, edit, and delete webhook subscriptions for event notifications (`product.created`, `product.updated`, `product.deleted`, `import.completed`, `products.cleared`).
+   - Secret key generator and display for HMAC-SHA256 signature verification.
+   - Interactive webhook test trigger with real-time HTTP response status and latency reporting.
+
+---
+
+## Architecture & State Management
+
+- **Next.js App Router**: Optimized layout and page structure located in `src/app/`.
+- **Server-Sent Events (`EventSource`)**: Unidirectional real-time telemetry stream from `GET /api/v1/imports/{id}/progress`.
+- **Monotonic Progress Engine**: Out-of-order SSE events are discarded using sequence numbers (`seq`). Both SSE and fallback polling enforce `Math.max(prev, current)` so the progress bar never regresses.
+- **API Client (`src/lib/api.ts`)**: Strongly typed Axios client with centralized error handling and dynamic base URL resolution.
+
+---
+
+## Local Development
+
+### Prerequisites
+- Node.js 20+ LTS
+- npm 10+
+
+### Installation & Running
 ```bash
+# 1. Install dependencies
+npm install
+
+# 2. Configure environment (optional, defaults to http://localhost:8000/api/v1)
+cp .env.example .env.local
+
+# 3. Start development server with Turbopack
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Visit [http://localhost:3000](http://localhost:3000) in your browser.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+---
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Build & Quality Checks
 
-## Learn More
+```bash
+# Run TypeScript type check
+npx tsc --noEmit
 
-To learn more about Next.js, take a look at the following resources:
+# Build production bundle with Turbopack
+npm run build
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+# Start production server
+npm start
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+---
 
-## Deploy on Vercel
+## Environment Variables
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+| Variable | Description | Default |
+| :--- | :--- | :--- |
+| `NEXT_PUBLIC_API_URL` | Public backend API URL accessible by the browser | `http://localhost:8000/api/v1` |
+| `PORT` | Local dev server port | `3000` |

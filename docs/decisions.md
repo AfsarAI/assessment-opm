@@ -81,3 +81,15 @@ This document records the critical architectural, data, and engineering decision
 - **Rationale**:
   - Synchronous webhooks in CRUD routes would block API latency and make the server vulnerable to slow-consumer DDoS.
   - Webhooks accepting arbitrary URLs can be exploited to probe internal microservices (`localhost`, `169.254.169.254` AWS/GCP instance metadata). Pre-resolving and blocking private subnets mitigates SSRF vulnerabilities.
+
+---
+
+## ADR 009: Strictly Monotonic Progress Telemetry Pipeline
+- **Decision**: Enforce strictly monotonic progress ($P_{t+1} \ge P_t$) across all four defensive layers: Celery/Redis (`import_seq`, `import_max_progress`), PostgreSQL (`GREATEST(progress, :progress)`), FastAPI (`max_streamed_progress`, overlaying Redis cache), and React (`Math.max`, sequence drop guard).
+- **Context**: Intermediate catalogue UPSERT chunks (74%, 78%, 82%, 86%, 90%) published to Redis were temporarily pulled backwards to 65% when the frontend's 2.5s watchdog fallback timer polled PostgreSQL.
+- **Rationale**:
+  - User-facing progress must never regress or fluctuate backwards.
+  - Database updates during UPSERT chunks synchronize PostgreSQL with Redis Pub/Sub.
+  - Multi-layer defense ensures that even under network lag, SSE packet re-ordering, or watchdog polling races, progress moves monotonically forward to 100%.
+  - Cancellation preserves reached progress rather than zeroing out.
+

@@ -64,6 +64,7 @@ This checklist audits every required component and edge case for public producti
 ### REAL-TIME SSE PROGRESS
 - [x] Server-Sent Events stream (`GET /api/v1/imports/{id}/progress`) powered by Redis Pub/Sub.
 - [x] Real-time state transitions (`PARSING` $\rightarrow$ `VALIDATING` $\rightarrow$ `IMPORTING` $\rightarrow$ `COMPLETED`).
+- [x] Strictly monotonic progress guarantees ($P_{t+1} \ge P_t$) preventing backward fluctuations across SSE and watchdog polling.
 - [x] 15-second heartbeat ping preventing cloud proxy idle disconnects.
 - [x] Clean terminal disconnect upon completion.
 
@@ -88,6 +89,8 @@ This checklist audits every required component and edge case for public producti
 
 ---
 
-### AUTOMATED TESTS
-- [x] 22/22 unit and integration tests passing in 3.09s (`pytest tests/ -v`).
-- [x] Multi-tier CSV benchmark scripts operational (100, 10K, 100K, 500K rows).
+### AUTOMATED TESTS & VERIFICATION
+- [x] 29/29 unit and integration tests passing in ~4.3s (`pytest tests/ -v`).
+- [x] Multi-tier CSV benchmark scripts operational (100, 1K, 10K, 100K, 500K rows).
+- [x] Automated monotonicity verification script (`scripts/verify_monotonic_import.py`) verifying 0 backward events across all datasets.
+
