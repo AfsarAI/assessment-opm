@@ -77,9 +77,9 @@ def update_job_db(
                         """
                         UPDATE import_jobs
                         SET status = CAST(:status AS VARCHAR(50)),
-                            progress = :progress,
+                            progress = GREATEST(progress, :progress),
                             stage_message = :stage_msg,
-                            processed_rows = :processed,
+                            processed_rows = GREATEST(processed_rows, :processed),
                             successful_rows = :successful,
                             failed_rows = :failed,
                             error_message = :err,
@@ -127,26 +127,53 @@ def publish_progress(
     failed_rows: int,
     stage_message: str,
     error_message: Optional[str] = None,
-):
+) -> int:
+    """Publishes strictly monotonic progress events to Redis Pub/Sub and caches latest state."""
+    import_id_str = str(import_id)
+    seq = 1
+    safe_progress = progress
+
+    try:
+        seq = r.incr(f"import_seq:{import_id_str}")
+        max_key = f"import_max_progress:{import_id_str}"
+        prev_max = r.get(max_key)
+        prev_val = int(prev_max) if prev_max is not None else 0
+
+        if status in ("COMPLETED", "COMPLETED_WITH_ERRORS"):
+            safe_progress = 100
+        elif status in ("CANCELLED", "FAILED"):
+            # Preserve achieved progress on cancellation or failure, never drop to 0
+            safe_progress = max(prev_val, progress) if progress > 0 else prev_val
+        else:
+            safe_progress = max(prev_val, progress)
+
+        if safe_progress != prev_val:
+            r.setex(max_key, 3600, str(safe_progress))
+    except Exception as e:
+        logger.debug(f"Redis monotonic tracking notice for {import_id_str}: {e}")
+
     payload = {
-        "import_id": str(import_id),
+        "import_id": import_id_str,
         "status": status,
-        "progress": progress,
+        "progress": safe_progress,
         "processed_rows": processed_rows,
         "total_rows": total_rows,
         "successful_rows": successful_rows,
         "failed_rows": failed_rows,
         "stage_message": stage_message,
         "error_message": error_message,
+        "seq": seq,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-    channel = f"import_progress:{import_id}"
+    channel = f"import_progress:{import_id_str}"
     try:
         r.publish(channel, json.dumps(payload))
         # Also store the latest state in Redis with 1-hour expiry for instant fetch
-        r.setex(f"import_latest:{import_id}", 3600, json.dumps(payload))
+        r.setex(f"import_latest:{import_id_str}", 3600, json.dumps(payload))
     except Exception as e:
-        logger.warning(f"Failed to publish progress to Redis for import {import_id}: {e}")
+        logger.warning(f"Failed to publish progress to Redis for import {import_id_str}: {e}")
+
+    return safe_progress
 
 
 def execute_import_pipeline(job_id_str: str, file_path: str):
@@ -289,8 +316,8 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
 
         # 4. Pass 2: Stream ONLY winning unique records via raw PostgreSQL COPY FROM STDIN
         stage_msg = f"Validating and streaming data to staging: 0 / {total_rows:,} rows..."
-        update_job_db(job_id_str, "VALIDATING", 15, stage_msg, 0, 0, failed_rows)
-        publish_progress(r, job_id_str, "VALIDATING", 15, 0, total_rows, 0, failed_rows, stage_msg)
+        update_job_db(job_id_str, "VALIDATING", 10, stage_msg, 0, 0, failed_rows)
+        publish_progress(r, job_id_str, "VALIDATING", 10, 0, total_rows, 0, failed_rows, stage_msg)
 
         NUM_CHUNKS = 5 if unique_product_count >= 50000 else 1
         chunk_size_unique = math.ceil(unique_product_count / NUM_CHUNKS) if unique_product_count > 0 else 1
@@ -342,7 +369,9 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
                         staged_rows += len(batch_valid)
                         batch_valid.clear()
 
-                        progress_pct = int(15 + (processed_rows / total_rows) * 45) if total_rows > 0 else 50
+                        # Progress smoothly scaled between 10% and 60%
+                        progress_pct = int(10 + (processed_rows / total_rows) * 50) if total_rows > 0 else 50
+                        progress_pct = min(60, max(10, progress_pct))
                         stage_msg = f"Validated and staged {processed_rows:,} / {total_rows:,} rows..."
                         publish_progress(
                             r,
@@ -355,7 +384,7 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
                             failed_rows,
                             stage_msg,
                         )
-                        if processed_rows % 100000 == 0:
+                        if processed_rows % 50000 == 0:
                             update_job_db(job_id_str, "VALIDATING", progress_pct, stage_msg, processed_rows, 0, failed_rows)
 
                 # Flush final batch
@@ -374,6 +403,21 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
                     raw_db_conn.commit()
                     staged_rows += len(batch_valid)
                     batch_valid.clear()
+
+                # Ensure staging is marked 60% complete for all file sizes
+                stage_msg = f"Validated and staged {processed_rows:,} / {total_rows:,} rows..."
+                publish_progress(
+                    r,
+                    job_id_str,
+                    "VALIDATING",
+                    60,
+                    processed_rows,
+                    total_rows,
+                    0,
+                    failed_rows,
+                    stage_msg,
+                )
+                update_job_db(job_id_str, "VALIDATING", 60, stage_msg, processed_rows, 0, failed_rows)
 
             finally:
                 raw_cursor.close()
@@ -472,6 +516,7 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
                             failed_rows,
                             stage_msg,
                         )
+                        update_job_db(job_id_str, "IMPORTING", pct, stage_msg, processed_rows, 0, failed_rows)
 
                     # Check cancellation right before commit
                     check_cancellation(job_id_str, r)
@@ -582,10 +627,17 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
             pass
 
         # Update import_jobs as CANCELLED in PostgreSQL with 0 succeeded rows
+        cur_prog = 0
+        try:
+            val = r.get(f"import_max_progress:{job_id_str}")
+            cur_prog = int(val) if val else 0
+        except Exception:
+            pass
+
         update_job_db(
             job_id_str,
             "CANCELLED",
-            0,
+            cur_prog,
             "Import cancelled by user",
             processed_rows,
             0,
@@ -595,7 +647,7 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
             r,
             job_id_str,
             "CANCELLED",
-            0,
+            cur_prog,
             processed_rows,
             total_rows,
             0,
@@ -645,10 +697,17 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
             except Exception:
                 pass
 
+            cur_prog = 0
+            try:
+                val = r.get(f"import_max_progress:{job_id_str}")
+                cur_prog = int(val) if val else 0
+            except Exception:
+                pass
+
             update_job_db(
                 job_id_str,
                 "CANCELLED",
-                0,
+                cur_prog,
                 "Import cancelled by user",
                 processed_rows,
                 0,
@@ -658,7 +717,7 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
                 r,
                 job_id_str,
                 "CANCELLED",
-                0,
+                cur_prog,
                 processed_rows,
                 total_rows,
                 0,
@@ -689,12 +748,19 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
         except Exception:
             pass
 
+        cur_prog = 0
+        try:
+            val = r.get(f"import_max_progress:{job_id_str}")
+            cur_prog = int(val) if val else 0
+        except Exception:
+            pass
+
         # Update import_jobs as FAILED in PostgreSQL
         # Do NOT report uncommitted rows as succeeded
         update_job_db(
             job_id_str,
             "FAILED",
-            0,
+            cur_prog,
             "Import failed",
             processed_rows,
             0,
@@ -705,7 +771,7 @@ def execute_import_pipeline(job_id_str: str, file_path: str):
             r,
             job_id_str,
             "FAILED",
-            0,
+            cur_prog,
             processed_rows,
             total_rows,
             0,

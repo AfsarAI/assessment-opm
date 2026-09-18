@@ -29,6 +29,7 @@ export const ImportManager: React.FC = () => {
   const eventSourceRef = useRef<EventSource | null>(null);
   const fallbackPollRef = useRef<NodeJS.Timeout | null>(null);
   const currentXhrRef = useRef<XMLHttpRequest | null>(null);
+  const lastSeenSeqRef = useRef<number>(0);
 
   const loadRecentJobs = async () => {
     try {
@@ -77,6 +78,7 @@ export const ImportManager: React.FC = () => {
       fallbackPollRef.current = null;
     }
 
+    lastSeenSeqRef.current = 0;
     const sseUrl = getImportProgressUrl(jobId);
     const es = new EventSource(sseUrl);
     eventSourceRef.current = es;
@@ -96,34 +98,48 @@ export const ImportManager: React.FC = () => {
     es.addEventListener("progress", (event) => {
       try {
         const data: ImportProgressEvent = JSON.parse(event.data);
+
+        // Sequence number check: ignore stale out-of-order events
+        if (data.seq !== undefined && data.seq < lastSeenSeqRef.current) {
+          return;
+        }
+        if (data.seq !== undefined) {
+          lastSeenSeqRef.current = data.seq;
+        }
+
         setActiveJob((prev) => {
           if (!prev) return null;
+          // Invariant: displayed progress must NEVER decrease for the same import
+          const safeProgress = data.status === "COMPLETED" 
+            ? 100 
+            : Math.max(prev.progress, data.progress);
+
           return {
             ...prev,
             status: data.status,
-            progress: data.progress,
-            processed_rows: data.processed_rows,
-            total_rows: data.total_rows,
+            progress: safeProgress,
+            processed_rows: Math.max(prev.processed_rows, data.processed_rows),
+            total_rows: data.total_rows > 0 ? data.total_rows : prev.total_rows,
             successful_rows: data.successful_rows,
             failed_rows: data.failed_rows,
-            stage_message: data.stage_message,
+            stage_message: data.stage_message || prev.stage_message,
             error_message: data.error_message,
           };
         });
 
-        // Sync history table in real time
+        // Sync history table in real time monotonically
         setRecentJobs((prev) =>
           prev.map((j) =>
             j.id === jobId
               ? {
                   ...j,
                   status: data.status,
-                  progress: data.progress,
-                  processed_rows: data.processed_rows,
-                  total_rows: data.total_rows,
+                  progress: data.status === "COMPLETED" ? 100 : Math.max(j.progress, data.progress),
+                  processed_rows: Math.max(j.processed_rows, data.processed_rows),
+                  total_rows: data.total_rows > 0 ? data.total_rows : j.total_rows,
                   successful_rows: data.successful_rows,
                   failed_rows: data.failed_rows,
-                  stage_message: data.stage_message,
+                  stage_message: data.stage_message || j.stage_message,
                 }
               : j
           )
@@ -147,16 +163,42 @@ export const ImportManager: React.FC = () => {
       try {
         const current = await getImport(jobId);
         if (["COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED", "CANCELLED"].includes(current.status)) {
-          setActiveJob(current);
-          setRecentJobs((prev) => prev.map((j) => (j.id === jobId ? current : j)));
+          setActiveJob((prev) => {
+            const finalProgress = current.status === "COMPLETED" 
+              ? 100 
+              : Math.max(prev?.progress ?? 0, current.progress);
+            return {
+              ...(prev || current),
+              ...current,
+              progress: finalProgress,
+            };
+          });
+          setRecentJobs((prev) =>
+            prev.map((j) =>
+              j.id === jobId
+                ? {
+                    ...j,
+                    ...current,
+                    progress: current.status === "COMPLETED" ? 100 : Math.max(j.progress, current.progress),
+                  }
+                : j
+            )
+          );
           handleTerminalStatus();
         } else {
           setActiveJob((prev) => {
             if (!prev) return current;
-            if (current.progress > prev.progress || current.status !== prev.status || current.stage_message !== prev.stage_message) {
-              return { ...prev, ...current };
-            }
-            return prev;
+            // Invariant: watchdog polling must NEVER pull progress or stage backwards!
+            const safeProgress = Math.max(prev.progress, current.progress);
+            const safeProcessed = Math.max(prev.processed_rows, current.processed_rows);
+            return {
+              ...prev,
+              ...current,
+              progress: safeProgress,
+              processed_rows: safeProcessed,
+              total_rows: current.total_rows > 0 ? current.total_rows : prev.total_rows,
+              stage_message: current.progress >= prev.progress ? current.stage_message : prev.stage_message,
+            };
           });
         }
       } catch {}

@@ -46,6 +46,8 @@ class ImportProgressPayload(BaseModel):
     failed_rows: int
     stage_message: str
     error_message: Optional[str] = None
+    seq: Optional[int] = None
+    timestamp: Optional[str] = None
 
 
 class ImportCancelResponse(BaseModel):

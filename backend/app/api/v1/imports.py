@@ -128,6 +128,26 @@ async def get_import_job(
     if not job:
         raise ImportNotFoundException(str(import_id))
 
+    # If job is actively processing, overlay real-time state from Redis cache if newer
+    if job.status in ("QUEUED", "PARSING", "VALIDATING", "IMPORTING"):
+        try:
+            r = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+            cached_raw = await r.get(f"import_latest:{str(import_id)}")
+            await r.aclose()
+            if cached_raw:
+                cached = json.loads(cached_raw)
+                cached_prog = cached.get("progress", 0)
+                if cached_prog >= job.progress:
+                    job.progress = cached_prog
+                    if cached.get("stage_message"):
+                        job.stage_message = cached["stage_message"]
+                    if cached.get("processed_rows", 0) >= job.processed_rows:
+                        job.processed_rows = cached["processed_rows"]
+                    if cached.get("total_rows", 0) > 0:
+                        job.total_rows = cached["total_rows"]
+        except Exception:
+            pass
+
     return job
 
 
@@ -183,9 +203,19 @@ async def cancel_import_job(
         except Exception:
             pass
 
+        # Preserve highest reached progress
+        cancel_prog = job.progress
+        try:
+            val = await r.get(f"import_max_progress:{import_id_str}")
+            if val is not None:
+                cancel_prog = max(cancel_prog, int(val))
+        except Exception:
+            pass
+
         # 4. Update database record to CANCELLED
         job.status = "CANCELLED"
         job.stage_message = "Import cancelled by user"
+        job.progress = cancel_prog
         job.completed_at = datetime.now(timezone.utc)
         # Ensure partial data is never reported as succeeded
         job.successful_rows = 0
@@ -208,17 +238,24 @@ async def cancel_import_job(
             except Exception:
                 pass
 
+        seq = 1
+        try:
+            seq = await r.incr(f"import_seq:{import_id_str}")
+        except Exception:
+            pass
+
         # 7. Publish CANCELLED to Redis Pub/Sub
         cancel_payload = {
             "import_id": import_id_str,
             "status": "CANCELLED",
-            "progress": 0,
+            "progress": cancel_prog,
             "processed_rows": job.processed_rows,
             "total_rows": job.total_rows,
             "successful_rows": 0,
             "failed_rows": job.failed_rows,
             "stage_message": "Import cancelled by user",
             "error_message": None,
+            "seq": seq,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         await r.publish(f"import_progress:{import_id_str}", json.dumps(cancel_payload))
@@ -277,6 +314,8 @@ async def stream_import_progress(
         }
 
     async def sse_event_generator():
+        max_streamed_progress = initial_payload.get("progress", 0)
+
         # Yield current initial state immediately
         yield f"event: progress\ndata: {json.dumps(initial_payload)}\n\n"
 
@@ -305,10 +344,11 @@ async def stream_import_progress(
                         res = await db.execute(stmt)
                         current_db_job = res.scalar_one_or_none()
                         if current_db_job and current_db_job.status in ("COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED", "CANCELLED"):
+                            term_prog = 100 if current_db_job.status in ("COMPLETED", "COMPLETED_WITH_ERRORS") else max(max_streamed_progress, current_db_job.progress)
                             term_payload = {
                                 "import_id": import_id_str,
                                 "status": current_db_job.status,
-                                "progress": 100 if current_db_job.status == "COMPLETED" else current_db_job.progress,
+                                "progress": term_prog,
                                 "processed_rows": current_db_job.processed_rows,
                                 "total_rows": current_db_job.total_rows,
                                 "successful_rows": current_db_job.successful_rows,
@@ -327,6 +367,18 @@ async def stream_import_progress(
 
                 if message and message["type"] == "message":
                     raw_data = message["data"]
+                    try:
+                        parsed = json.loads(raw_data)
+                        if "progress" in parsed:
+                            if parsed.get("status") in ("COMPLETED", "COMPLETED_WITH_ERRORS"):
+                                parsed["progress"] = 100
+                            else:
+                                parsed["progress"] = max(max_streamed_progress, parsed["progress"])
+                            max_streamed_progress = parsed["progress"]
+                            raw_data = json.dumps(parsed)
+                    except Exception:
+                        pass
+
                     yield f"event: progress\ndata: {raw_data}\n\n"
 
                     # Check for terminal state to cleanly close SSE connection

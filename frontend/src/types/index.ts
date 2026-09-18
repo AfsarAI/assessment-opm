@@ -57,6 +57,8 @@ export interface ImportProgressEvent {
   failed_rows: number;
   stage_message: string;
   error_message?: string | null;
+  seq?: number;
+  timestamp?: string;
 }
 
 export interface Webhook {
