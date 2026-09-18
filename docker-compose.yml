@@ -43,6 +43,8 @@ services:
     env_file:
       - .env
     environment:
+      - PORT=8000
+      - BACKEND_PORT=8000
       - DATABASE_URL=postgresql+asyncpg://opm_user:opm_password@db:5432/opm_db
       - SYNC_DATABASE_URL=postgresql+psycopg://opm_user:opm_password@db:5432/opm_db
       - REDIS_URL=redis://redis:6379/0
@@ -71,6 +73,7 @@ services:
     env_file:
       - .env
     environment:
+      - SERVICE_TYPE=worker
       - DATABASE_URL=postgresql+asyncpg://opm_user:opm_password@db:5432/opm_db
       - SYNC_DATABASE_URL=postgresql+psycopg://opm_user:opm_password@db:5432/opm_db
       - REDIS_URL=redis://redis:6379/0

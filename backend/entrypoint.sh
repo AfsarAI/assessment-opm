@@ -3,7 +3,7 @@ set -e
 
 echo "=== Assessment OPM Production Entrypoint Starting ==="
 
-PORT="${PORT:-8000}"
+PORT="${BACKEND_PORT:-${PORT:-8000}}"
 SERVICE_TYPE="${SERVICE_TYPE:-all}" # 'all', 'web', 'worker'
 
 # 1. Start embedded Redis if REDIS_URL targets localhost or 127.0.0.1

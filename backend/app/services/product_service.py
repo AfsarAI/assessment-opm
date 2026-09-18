@@ -45,14 +45,14 @@ class ProductService:
         limit = min(max(1, limit), 100)
         offset = (page - 1) * limit
 
-        # Base filter conditions
+        # Base filter conditions with GIN trigram index utilization
         conditions = []
         if sku:
-            conditions.append(func.lower(Product.sku).like(f"%{sku.strip().lower()}%"))
+            conditions.append(Product.sku.ilike(f"%{sku.strip()}%"))
         if name:
-            conditions.append(func.lower(Product.name).like(f"%{name.strip().lower()}%"))
+            conditions.append(Product.name.ilike(f"%{name.strip()}%"))
         if description:
-            conditions.append(func.lower(Product.description).like(f"%{description.strip().lower()}%"))
+            conditions.append(Product.description.ilike(f"%{description.strip()}%"))
         if status and status.lower() in ("active", "true"):
             conditions.append(Product.active.is_(True))
         elif status and status.lower() in ("inactive", "false"):
@@ -70,8 +70,10 @@ class ProductService:
         if conditions:
             stmt = stmt.where(*conditions)
 
-        # Sorting
-        sort_column = getattr(Product, sort_by, Product.created_at)
+        # Safe Sorting with whitelisted columns
+        allowed_sort_fields = {"id", "sku", "name", "active", "created_at", "updated_at"}
+        safe_sort_by = sort_by if sort_by in allowed_sort_fields else "created_at"
+        sort_column = getattr(Product, safe_sort_by, Product.created_at)
         if sort_order.lower() == "asc":
             stmt = stmt.order_by(sort_column.asc())
         else:
