@@ -182,7 +182,8 @@ assessment-opm/
 │   ├── benchmarks.md          # In-depth benchmark analysis: Local vs. Production
 │   ├── decisions.md           # Architecture Decision Records (ADRs 001–009)
 │   ├── deployment.md          # Zero-cost production deployment guide (Render & Vercel)
-│   └── production-checklist.md# Requirements verification and production readiness matrix
+│   ├── production-checklist.md# Requirements verification and production readiness matrix
+│   └── testing.md             # Concise testing, benchmark & quality assurance guide
 ├── scripts/                   # Evaluation, benchmark, and verification utilities
 │   ├── benchmark_import.py    # Ingestion benchmark runner
 │   ├── generate_sample_csvs.py# Deterministic generator for 100, 1K, 10K, 100K sample files
@@ -550,39 +551,59 @@ See [`docs/benchmarks.md`](docs/benchmarks.md) for detailed hardware analysis an
 
 ## 16. Automated Testing & Quality Assurance
 
+> [!TIP]
+> A complete, step-by-step verification guide with expected outputs and assertions is available in [`docs/testing.md`](docs/testing.md).
+
 ### 1. Pytest Backend Test Suite (29 Tests)
 The test suite validates health checks, product CRUD, case-insensitive SKU uniqueness, pagination, CSV import validation, error logging, and webhook delivery:
 
 ```bash
-# Run pytest in local Docker container
+# Run pytest in local Docker container (Recommended)
 docker exec -it opm_backend pytest -v
+
+# Or run natively
+cd backend && source .venv/bin/activate && pytest -v
 ```
 **Result**: `29 passed, 1 warning in 4.28s`.
 
 ### 2. Monotonicity Verification Across All Dataset Sizes
-Run the automated verification script against any local or production target to assert that progress never moves backwards:
+Run the automated verification script against any local or production target to assert that progress never moves backwards ($P_{t+1} \ge P_t$):
 
 ```bash
-# Test 100 rows
+# Test 100 rows (smoke check)
 python3 scripts/verify_monotonic_import.py http://localhost:8000 scripts/samples/products_100.csv
 
-# Test 1,000 rows
+# Test 1,000 rows (integration check)
 python3 scripts/verify_monotonic_import.py http://localhost:8000 scripts/samples/products_1000.csv
 
-# Test 10,000 rows
+# Test 10,000 rows (medium benchmark)
 python3 scripts/verify_monotonic_import.py http://localhost:8000 scripts/samples/products_10000.csv
 
-# Test 100,000 rows
+# Test 100,000 rows (stress benchmark)
 python3 scripts/verify_monotonic_import.py http://localhost:8000 scripts/samples/products_100000.csv
 
-# Test 500,000 rows
+# Test 500,000 rows (full benchmark)
 python3 scripts/verify_monotonic_import.py http://localhost:8000 products.csv
 
-# Test cancellation (verifies progress is preserved and does not drop to 0%)
+# Test dynamic cancellation (verifies progress is preserved and does not drop to 0%)
 python3 scripts/verify_monotonic_import.py http://localhost:8000 scripts/samples/products_100000.csv cancel
 ```
 
-### 3. Frontend Typecheck & Build
+### 3. API Responsiveness & Benchmarks Under Load
+Measure API response latency (p50, p95, p99) under active 500,000-row ingestion load:
+
+```bash
+# High-concurrency responsiveness benchmark
+python3 scripts/test_responsiveness.py
+
+# End-to-end 500K ingestion benchmark
+python3 scripts/benchmark_import.py products.csv
+
+# Multi-tier scale benchmark suite
+python3 scripts/benchmark_suite.py
+```
+
+### 4. Frontend Typecheck & Build
 ```bash
 cd frontend
 npx tsc --noEmit

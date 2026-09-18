@@ -93,4 +93,5 @@ This checklist audits every required component and edge case for public producti
 - [x] 29/29 unit and integration tests passing in ~4.3s (`pytest tests/ -v`).
 - [x] Multi-tier CSV benchmark scripts operational (100, 1K, 10K, 100K, 500K rows).
 - [x] Automated monotonicity verification script (`scripts/verify_monotonic_import.py`) verifying 0 backward events across all datasets.
+- [x] Dedicated testing and benchmarking guide published (`docs/testing.md`).
 

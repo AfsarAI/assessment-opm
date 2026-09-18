@@ -9,6 +9,7 @@ Measures:
 - Status transitions and final record count
 """
 
+import os
 import sys
 import time
 import json
@@ -16,11 +17,12 @@ import urllib.request
 import urllib.error
 from datetime import datetime
 
-API_BASE = "http://localhost:8000/api/v1"
+API_BASE = os.getenv("API_BASE", "http://localhost:8000/api/v1")
+HEALTH_URL = API_BASE.replace("/api/v1", "/health")
 
 def check_health():
     try:
-        req = urllib.request.Request("http://localhost:8000/health")
+        req = urllib.request.Request(HEALTH_URL)
         with urllib.request.urlopen(req, timeout=5) as res:
             if res.status == 200:
                 print("✓ Backend health check passed.")

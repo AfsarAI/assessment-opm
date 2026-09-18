@@ -10,13 +10,13 @@ import time
 import json
 import requests
 
-API_BASE = "https://opm-backend-rf77.onrender.com"
+API_BASE = os.getenv("API_BASE", "https://opm-backend-rf77.onrender.com")
 
 FILES = [
-    ("100 rows", "sample_100.csv"),
-    ("1,000 rows", "sample_1000.csv"),
-    ("10,000 rows", "sample_10000.csv"),
-    ("100,000 rows", "sample_100000.csv"),
+    ("100 rows", "scripts/samples/products_100.csv"),
+    ("1,000 rows", "scripts/samples/products_1000.csv"),
+    ("10,000 rows", "scripts/samples/products_10000.csv"),
+    ("100,000 rows", "scripts/samples/products_100000.csv"),
 ]
 
 def benchmark_file(label, filename):
